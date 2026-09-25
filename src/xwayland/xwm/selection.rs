@@ -43,6 +43,11 @@ pub const INCR_CHUNK_SIZE: usize = 64 * 1024;
 /// either bound is refused -- the reader sees an empty transfer -- not queued.
 pub const MAX_SELECTION_TRANSFERS: usize = 8;
 
+/// The most transfers into Wayland clients one X client's selection may have under way at once,
+/// out of [`MAX_SELECTION_TRANSFERS`]: an owner that trickles its data -- progress enough never to
+/// time out -- can hold only its share, never keep a different owner's pastes out.
+pub const MAX_INCOMING_PER_CLIENT: usize = 4;
+
 /// A transfer, either way, that has not moved for this long is dropped the next time the window
 /// manager looks (a new request, a new answer, a change of owner). The default for
 /// [`X11Wm::set_selection_transfer_timeout`](super::X11Wm::set_selection_transfer_timeout).
@@ -146,6 +151,8 @@ pub struct IncomingTransfer {
     /// The selection's ownership count when the transfer was answered: a transfer whose owner
     /// has since changed or gone can stall for good.
     pub generation: u64,
+    /// The client bits of the owner window's id when the transfer was answered.
+    pub owner_client: u32,
 }
 
 impl fmt::Debug for IncomingTransfer {
@@ -165,7 +172,13 @@ impl fmt::Debug for IncomingTransfer {
 
 impl IncomingTransfer {
     /// A transfer into `fd` through `window`, not started.
-    pub fn new(token: RegistrationToken, window: OwnedX11Window, fd: Arc<OwnedFd>, generation: u64) -> Self {
+    pub fn new(
+        token: RegistrationToken,
+        window: OwnedX11Window,
+        fd: Arc<OwnedFd>,
+        generation: u64,
+        owner_client: u32,
+    ) -> Self {
         IncomingTransfer {
             token: Some(token),
             window,
@@ -178,6 +191,7 @@ impl IncomingTransfer {
             awaiting_chunk: false,
             last_activity: Instant::now(),
             generation,
+            owner_client,
         }
     }
 

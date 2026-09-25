@@ -2122,10 +2122,22 @@ where
                         return Ok(());
                     }
                     selection.sweep(xwm.selection_transfer_timeout, loop_handle);
-                    if selection.incoming.len() >= MAX_SELECTION_TRANSFERS {
+                    // Whose answer this is: the client bits of the owner window's id. (An owner
+                    // may name another client's window; that only moves which share it uses.)
+                    let owner_client = selection.owner & !conn.setup().resource_id_mask;
+                    let from_owner = selection
+                        .incoming
+                        .values()
+                        .filter(|transfer| transfer.owner_client == owner_client)
+                        .count();
+                    if selection.incoming.len() >= MAX_SELECTION_TRANSFERS
+                        || from_owner >= MAX_INCOMING_PER_CLIENT
+                    {
                         // Refused, not queued: the reader sees an empty transfer.
                         debug!(
                             requestor = n.requestor,
+                            from_owner,
+                            total = selection.incoming.len(),
                             "Refusing an incoming selection transfer: too many under way"
                         );
                         return Ok(());
@@ -2171,7 +2183,8 @@ where
                         .map_err(|err| err.error)?;
                     loop_handle.disable(&token)?;
 
-                    let mut transfer = IncomingTransfer::new(token, window, fd, selection.generation);
+                    let mut transfer =
+                        IncomingTransfer::new(token, window, fd, selection.generation, owner_client);
                     match transfer.read_slice(&conn, &xwm.atoms) {
                         Ok(type_) if type_ == xwm.atoms.INCR => {
                             // The INCR announcement: its value is a size, not data. Deleting it
@@ -2326,6 +2339,8 @@ where
                         // likes (review of scoot PR #246: 300 windows, 300 fds, held until the
                         // client quit). Bounded per X client -- the client bits of the
                         // requestor's window id, which the server allocates -- and in total.
+                        // A client can name another client's window as the requestor, which
+                        // spends that client's share instead of its own; the total holds.
                         selection.sweep(xwm.selection_transfer_timeout, loop_handle);
                         let client_mask = !conn.setup().resource_id_mask;
                         let client = n.requestor & client_mask;
