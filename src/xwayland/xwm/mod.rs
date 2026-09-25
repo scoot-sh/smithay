@@ -2193,10 +2193,16 @@ where
                             return Ok(());
                         }
 
-                        let (recv_fd, send_fd) = rustix::pipe::pipe_with(
-                            rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
-                        )
-                        .map_err(|err| ConnectionError::IoError(std::io::Error::from(err)))?;
+                        // Only our end is non-blocking. The write end goes to the Wayland
+                        // client serving the selection, and `O_NONBLOCK` lives on the open
+                        // file description, so setting it on the pipe would hand that client
+                        // a non-blocking fd it never asked for -- a client writing with plain
+                        // blocking `write` then fails with `EAGAIN` as soon as the pipe fills
+                        // and ends the transfer early (measured: 64 KiB of a 2 MiB selection).
+                        let (recv_fd, send_fd) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
+                            .map_err(|err| ConnectionError::IoError(std::io::Error::from(err)))?;
+                        rustix::fs::fcntl_setfl(&recv_fd, OFlags::NONBLOCK)
+                            .map_err(|err| ConnectionError::IoError(std::io::Error::from(err)))?;
 
                         // It seems that if we ever try to reply to a selection request after
                         // another has been sent by the same requestor, the requestor never reads
