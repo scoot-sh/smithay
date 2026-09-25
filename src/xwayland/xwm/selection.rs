@@ -261,6 +261,9 @@ pub enum OutgoingAction {
     Done,
     DoneReading,
     WaitForReadable,
+    /// A chunk is buffered and the requestor has not yet taken the one before it: stop
+    /// reading until it deletes the property (see `read_selection_callback`).
+    WaitForDelete,
 }
 
 pub fn read_selection_callback(
@@ -269,6 +272,15 @@ pub fn read_selection_callback(
     fd: BorrowedFd<'_>,
     transfer: &mut OutgoingTransfer,
 ) -> Result<OutgoingAction, ReplyOrIdError> {
+    // Backpressure: while the requestor still holds the last chunk, a full chunk already
+    // waiting is all there is any use buffering. Reading on would pull the whole Wayland
+    // source into memory for a requestor that may never take it -- nothing else bounds
+    // this buffer. The source is re-enabled when the requestor deletes the property.
+    if transfer.incr && transfer.property_set && transfer.source_data.len() >= INCR_CHUNK_SIZE {
+        // The delete that resumes reading must also send the waiting chunk.
+        transfer.flush_property_on_delete = true;
+        return Ok(OutgoingAction::WaitForDelete);
+    }
     let mut buf = [0; INCR_CHUNK_SIZE];
     let Ok(len) = rustix::io::read(fd, &mut buf) else {
         debug!(

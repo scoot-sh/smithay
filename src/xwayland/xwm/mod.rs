@@ -2240,6 +2240,10 @@ where
                                         Ok(OutgoingAction::WaitForReadable) => {
                                             return Ok(PostAction::Continue);
                                         } // transfer ongoing
+                                        Ok(OutgoingAction::WaitForDelete) => {
+                                            // Re-enabled on the requestor's next delete.
+                                            return Ok(PostAction::Disable);
+                                        }
                                         Ok(OutgoingAction::Done) => {
                                             let _ = transfer.token.take();
                                             selection.outgoing.remove(&requestor);
@@ -2390,16 +2394,18 @@ where
                         let requestor = transfer.request.requestor;
                         trace!(requestor, len, "Send data chunk");
 
-                        if transfer.token.is_none() {
-                            if len > 0 || !transfer.sent_finished {
-                                // Either the transfer is done, but we still have bytes left, or
-                                // all bytes have been transferred but the final 0-byte data chunk
-                                // hasn't been sent yet
-                                transfer.flush_property_on_delete = true;
-                            } else {
-                                // done
-                                selection.outgoing.remove(&requestor);
-                            }
+                        if let Some(token) = transfer.token.as_ref() {
+                            // Still reading: the source may have been paused waiting for
+                            // this delete (`OutgoingAction::WaitForDelete`).
+                            let _ = loop_handle.enable(token);
+                        } else if len > 0 || !transfer.sent_finished {
+                            // Either the transfer is done, but we still have bytes left, or
+                            // all bytes have been transferred but the final 0-byte data chunk
+                            // hasn't been sent yet
+                            transfer.flush_property_on_delete = true;
+                        } else {
+                            // done
+                            selection.outgoing.remove(&requestor);
                         }
                     }
                 }
