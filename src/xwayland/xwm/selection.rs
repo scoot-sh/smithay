@@ -3,6 +3,7 @@ use std::{
     fmt,
     os::fd::{BorrowedFd, OwnedFd},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use calloop::{LoopHandle, RegistrationToken};
@@ -13,9 +14,8 @@ use x11rb::{
     protocol::{
         xfixes::{ConnectionExt as _, SelectionEventMask},
         xproto::{
-            Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, GetPropertyReply, PropMode,
-            SELECTION_NOTIFY_EVENT, Screen, SelectionNotifyEvent, SelectionRequestEvent, Window as X11Window,
-            WindowClass,
+            Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode, SELECTION_NOTIFY_EVENT,
+            Screen, SelectionNotifyEvent, SelectionRequestEvent, Window as X11Window, WindowClass,
         },
     },
     rust_connection::RustConnection,
@@ -36,6 +36,12 @@ pub const INCR_CHUNK_SIZE: usize = 64 * 1024;
 /// answered one up to a whole selection property; a paste and a clipboard manager reading
 /// together is the usual worst case.
 pub const MAX_SELECTION_TRANSFERS: usize = 8;
+
+/// How much of a selection property an incoming transfer reads at a time, in 32-bit units
+/// (`GetProperty` counts in those): one [`INCR_CHUNK_SIZE`]. The next slice is read only once
+/// this one has been written into the reader's pipe, so a transfer never buffers more than one
+/// slice, however large the owner makes the property.
+pub const PROPERTY_SLICE: u32 = (INCR_CHUNK_SIZE / 4) as u32;
 
 #[derive(Debug)]
 pub struct XWmSelection {
@@ -61,8 +67,21 @@ pub struct IncomingTransfer {
     pub window: OwnedX11Window,
 
     pub incr: bool,
+    /// Read from the property, not yet written to the reader: at most one slice.
     pub source_data: Vec<u8>,
-    pub incr_done: bool,
+    /// Where the next slice of the current property starts, in 32-bit units.
+    pub offset: u32,
+    /// The current property has more past `offset`.
+    pub more: bool,
+    /// INCR: the delete asking for the next chunk has been sent, and its `PropertyNotify`
+    /// not yet seen.
+    pub delete_sent: bool,
+    /// INCR: the delete has taken effect, so the owner's next write is the next chunk. Any
+    /// new value seen while this is unset -- an owner appending without waiting, or a
+    /// notify queued before the delete -- is ignored, never read.
+    pub awaiting_chunk: bool,
+    /// When the transfer last moved: a slice read, bytes written, a chunk arriving.
+    pub last_activity: Instant,
 }
 
 impl fmt::Debug for IncomingTransfer {
@@ -71,15 +90,51 @@ impl fmt::Debug for IncomingTransfer {
             .field("token", &self.token)
             .field("window", &self.window)
             .field("incr", &self.incr)
-            .field("source_data", &self.source_data)
-            .field("incr_done", &self.incr_done)
+            .field("buffered", &self.source_data.len())
+            .field("offset", &self.offset)
+            .field("more", &self.more)
+            .field("delete_sent", &self.delete_sent)
+            .field("awaiting_chunk", &self.awaiting_chunk)
             .finish()
     }
 }
 
 impl IncomingTransfer {
-    pub fn read_selection_prop(&mut self, reply: GetPropertyReply) {
-        self.source_data.extend(&reply.value)
+    /// A transfer into `fd` through `window`, not started.
+    pub fn new(token: RegistrationToken, window: OwnedX11Window) -> Self {
+        IncomingTransfer {
+            token: Some(token),
+            window,
+            incr: false,
+            source_data: Vec::new(),
+            offset: 0,
+            more: false,
+            delete_sent: false,
+            awaiting_chunk: false,
+            last_activity: Instant::now(),
+        }
+    }
+
+    /// Reads the next slice of the property into the buffer, returning the property's type.
+    pub fn read_slice(&mut self, conn: &RustConnection, atoms: &Atoms) -> Result<Atom, ReplyOrIdError> {
+        let reply = conn
+            .get_property(
+                false,
+                *self.window,
+                atoms._WL_SELECTION,
+                AtomEnum::ANY,
+                self.offset,
+                PROPERTY_SLICE,
+            )?
+            .reply()?;
+        // A full slice is a whole number of 32-bit units; only the last may not be, and
+        // nothing is read after it.
+        let units = u32::try_from(reply.value.len() / 4).unwrap_or(u32::MAX);
+        self.offset = self.offset.saturating_add(units);
+        self.more = reply.bytes_after > 0 && self.offset < u32::MAX;
+        self.source_data.extend_from_slice(&reply.value);
+        self.last_activity = Instant::now();
+        Ok(reply.type_)
     }
 
     pub fn write_selection(&mut self, fd: BorrowedFd<'_>) -> std::io::Result<bool> {
@@ -88,7 +143,10 @@ impl IncomingTransfer {
         }
 
         let len = rustix::io::write(fd, &self.source_data)?;
-        self.source_data = self.source_data.split_off(len);
+        if len > 0 {
+            self.source_data.drain(..len);
+            self.last_activity = Instant::now();
+        }
 
         Ok(self.source_data.is_empty())
     }
@@ -375,11 +433,14 @@ pub fn write_selection_callback(
 ) -> Result<IncomingAction, ReplyOrIdError> {
     match transfer.write_selection(fd) {
         Ok(true) => {
-            if transfer.incr {
-                // This delete asks the owner for the next chunk (the read did not delete), so
-                // it has to reach the server now, not whenever something else flushes.
-                conn.delete_property(*transfer.window, atoms._WL_SELECTION)?;
-                conn.flush()?;
+            if transfer.more {
+                // The next slice of the same property, now that this one is out.
+                transfer.read_slice(conn, atoms)?;
+                Ok(IncomingAction::WaitForWritable)
+            } else if transfer.incr {
+                // This delete asks the owner for the next chunk (reads never delete), so it
+                // has to reach the server now, not whenever something else flushes.
+                request_next_chunk(conn, atoms, transfer)?;
                 Ok(IncomingAction::WaitForProperty)
             } else {
                 debug!(?transfer, "Non-Incr Transfer complete!");
@@ -388,17 +449,28 @@ pub fn write_selection_callback(
         }
         Ok(false) => Ok(IncomingAction::WaitForWritable),
         Err(err) => {
+            // The reader went away: nothing more of the selection has anywhere to go. The owner
+            // is left waiting for a delete that will not come, which ICCCM owners time out.
             warn!(?err, "Transfer errored");
-            if transfer.incr {
-                // even if it failed, we still need to drain the incr transfer
-                conn.delete_property(*transfer.window, atoms._WL_SELECTION)?;
-                conn.flush()?;
-                Ok(IncomingAction::WaitForProperty)
-            } else {
-                Ok(IncomingAction::Done)
-            }
+            Ok(IncomingAction::Done)
         }
     }
+}
+
+/// Deletes the transfer's property, which asks an INCR owner for its next chunk, and notes that
+/// the chunk is only due once that delete is seen to take effect.
+pub fn request_next_chunk(
+    conn: &RustConnection,
+    atoms: &Atoms,
+    transfer: &mut IncomingTransfer,
+) -> Result<(), ReplyOrIdError> {
+    conn.delete_property(*transfer.window, atoms._WL_SELECTION)?;
+    conn.flush()?;
+    transfer.offset = 0;
+    transfer.more = false;
+    transfer.delete_sent = true;
+    transfer.awaiting_chunk = false;
+    Ok(())
 }
 
 pub fn send_selection_notify_resp(

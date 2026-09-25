@@ -2070,91 +2070,86 @@ where
                     }
                 }
                 _ => {
-                    let transfer = if let Some(transfer) = selection.incoming.get_mut(&n.requestor) {
-                        transfer
-                    } else {
-                        // create incoming transfer
-                        let Some((window, fd)) =
-                            selection.pending_transfers.lock().unwrap().remove(&n.requestor)
-                        else {
-                            // no file descriptor for incoming transfer
-                            warn!(
-                                "No file descriptor for incoming transfer to {}. Dropping...",
-                                n.requestor
-                            );
-                            return Ok(());
-                        };
-
-                        let loop_handle_clone = loop_handle.clone();
-                        let incoming_window = *window;
-                        let atom = n.selection;
-                        let token = loop_handle
-                            .insert_source(
-                                Generic::new(fd, Interest::WRITE, Mode::Level),
-                                move |_, fd, data| {
-                                    let xwm = data.xwm_state(xwm_id);
-                                    let conn = &xwm.conn;
-                                    let atoms = &xwm.atoms;
-                                    let selection = match atom {
-                                        x if x == xwm.atoms.CLIPBOARD => &mut xwm.clipboard,
-                                        x if x == xwm.atoms.PRIMARY => &mut xwm.primary,
-                                        x if x == xwm.atoms.XdndSelection => &mut xwm.dnd.selection,
-                                        _ => unreachable!(),
-                                    };
-                                    if let Some(transfer) = selection.incoming.get_mut(&incoming_window) {
-                                        match write_selection_callback(fd.as_fd(), conn, atoms, transfer) {
-                                            Ok(IncomingAction::WaitForWritable) => {
-                                                return Ok(PostAction::Continue);
-                                            }
-                                            Ok(IncomingAction::WaitForProperty) if !transfer.incr_done => {
-                                                return Ok(PostAction::Disable);
-                                            }
-                                            Ok(_) | Err(_) => {
-                                                selection
-                                                    .incoming
-                                                    .remove(&incoming_window)
-                                                    .unwrap()
-                                                    .destroy(&loop_handle_clone);
-                                            }
-                                        };
-                                    }
-                                    Ok(PostAction::Remove)
-                                },
-                            )
-                            .map_err(|err| err.error)?;
-                        loop_handle.disable(&token)?;
-
-                        let transfer = IncomingTransfer {
-                            token: Some(token),
-                            window,
-                            incr: false,
-                            source_data: Vec::new(),
-                            incr_done: false,
-                        };
-                        selection.incoming.insert(incoming_window, transfer);
-                        selection.incoming.get_mut(&incoming_window).unwrap()
+                    if selection.incoming.contains_key(&n.requestor) {
+                        // A transfer only ever starts once. Anything else claiming to answer the
+                        // same request -- a repeat, or a client forging the event -- is ignored:
+                        // re-reading would append the property again.
+                        debug!(requestor = n.requestor, "Ignoring a repeated SelectionNotify");
+                        return Ok(());
+                    }
+                    let Some((window, fd)) = selection.pending_transfers.lock().unwrap().remove(&n.requestor)
+                    else {
+                        // no file descriptor for incoming transfer
+                        warn!(
+                            "No file descriptor for incoming transfer to {}. Dropping...",
+                            n.requestor
+                        );
+                        return Ok(());
                     };
+                    if n.property == x11rb::NONE {
+                        // Refused: dropping the fd is the reader's end of file.
+                        return Ok(());
+                    }
 
-                    if let Some(prop) = conn
-                        .get_property(
-                            true,
-                            *transfer.window,
-                            xwm.atoms._WL_SELECTION,
-                            AtomEnum::ANY,
-                            0,
-                            0x1fffffff,
-                        )?
-                        .reply_unchecked()?
-                    {
-                        let type_ = prop.type_;
-                        if type_ == xwm.atoms.INCR {
+                    let loop_handle_clone = loop_handle.clone();
+                    let incoming_window = *window;
+                    let atom = n.selection;
+                    let token = loop_handle
+                        .insert_source(
+                            Generic::new(fd, Interest::WRITE, Mode::Level),
+                            move |_, fd, data| {
+                                let xwm = data.xwm_state(xwm_id);
+                                let conn = &xwm.conn;
+                                let atoms = &xwm.atoms;
+                                let selection = match atom {
+                                    x if x == xwm.atoms.CLIPBOARD => &mut xwm.clipboard,
+                                    x if x == xwm.atoms.PRIMARY => &mut xwm.primary,
+                                    x if x == xwm.atoms.XdndSelection => &mut xwm.dnd.selection,
+                                    _ => unreachable!(),
+                                };
+                                if let Some(transfer) = selection.incoming.get_mut(&incoming_window) {
+                                    match write_selection_callback(fd.as_fd(), conn, atoms, transfer) {
+                                        Ok(IncomingAction::WaitForWritable) => {
+                                            return Ok(PostAction::Continue);
+                                        }
+                                        Ok(IncomingAction::WaitForProperty) => {
+                                            return Ok(PostAction::Disable);
+                                        }
+                                        Ok(IncomingAction::Done) | Err(_) => {
+                                            if let Some(transfer) =
+                                                selection.incoming.remove(&incoming_window)
+                                            {
+                                                transfer.destroy(&loop_handle_clone);
+                                            }
+                                        }
+                                    };
+                                }
+                                Ok(PostAction::Remove)
+                            },
+                        )
+                        .map_err(|err| err.error)?;
+                    loop_handle.disable(&token)?;
+
+                    let mut transfer = IncomingTransfer::new(token, window);
+                    match transfer.read_slice(&conn, &xwm.atoms) {
+                        Ok(type_) if type_ == xwm.atoms.INCR => {
+                            // The INCR announcement: its value is a size, not data. Deleting it
+                            // asks for the first chunk.
                             transfer.incr = true;
-                            return Ok(());
-                        } else if transfer.token.is_some() {
-                            transfer.read_selection_prop(prop);
+                            transfer.source_data.clear();
+                            if request_next_chunk(&conn, &xwm.atoms, &mut transfer).is_err() {
+                                transfer.destroy(loop_handle);
+                                return Ok(());
+                            }
+                            selection.incoming.insert(incoming_window, transfer);
+                        }
+                        Ok(_) => {
                             let _ = loop_handle.enable(transfer.token.as_ref().unwrap());
-                        } else {
-                            selection.incoming.remove(&n.requestor);
+                            selection.incoming.insert(incoming_window, transfer);
+                        }
+                        Err(err) => {
+                            warn!(?err, "Could not read an incoming selection");
+                            transfer.destroy(loop_handle);
                         }
                     }
                 }
@@ -2382,7 +2377,7 @@ where
             }
         }
         Event::PropertyNotify(n) => {
-            if n.state == Property::NEW_VALUE && n.atom == xwm.atoms._WL_SELECTION {
+            if n.atom == xwm.atoms._WL_SELECTION {
                 if let Some(selection) = if xwm.clipboard.incoming.contains_key(&n.window) {
                     Some(&mut xwm.clipboard)
                 } else if xwm.primary.incoming.contains_key(&n.window) {
@@ -2393,38 +2388,30 @@ where
                     None
                 } {
                     let transfer = selection.incoming.get_mut(&n.window).unwrap();
-                    if transfer.incr {
-                        // Read without deleting: the delete is what asks the owner for the
-                        // next chunk, so it is sent only once this chunk has been written
-                        // out (`write_selection_callback`). Deleting here as well let the
-                        // owner's next chunk arrive before that second delete, which then
-                        // removed it unread -- the transfer ended after one chunk -- and
-                        // left nothing pacing the owner against a slow reader.
-                        if let Some(prop) = conn
-                            .get_property(
-                                false,
-                                *transfer.window,
-                                xwm.atoms._WL_SELECTION,
-                                AtomEnum::ANY,
-                                0,
-                                0x1fffffff,
-                            )?
-                            .reply_unchecked()?
-                        {
-                            if prop.value_len == 0 {
+                    if n.state == Property::DELETE && transfer.delete_sent {
+                        // Our delete took effect: the owner's next write is the next chunk.
+                        transfer.delete_sent = false;
+                        transfer.awaiting_chunk = true;
+                    } else if n.state == Property::NEW_VALUE && transfer.awaiting_chunk {
+                        // Read in slices, without deleting: the delete is what asks the owner
+                        // for the next chunk, so it is sent only once this one has been written
+                        // out (`write_selection_callback`). A new value seen at any other time
+                        // is not a chunk (an owner appending without waiting, a notify queued
+                        // before our delete) and is not read, so nothing is read twice.
+                        transfer.awaiting_chunk = false;
+                        match transfer.read_slice(&conn, &xwm.atoms) {
+                            Ok(_) if transfer.source_data.is_empty() && !transfer.more => {
                                 debug!(?transfer, "Incr Transfer complete!");
-                                if transfer.source_data.is_empty() {
-                                    selection.incoming.remove(&n.window).unwrap().destroy(loop_handle);
-                                } else {
-                                    transfer.incr_done = true;
-                                }
-                            } else {
-                                transfer.read_selection_prop(prop);
+                                selection.incoming.remove(&n.window).unwrap().destroy(loop_handle);
+                            }
+                            Ok(_) => {
                                 if let Some(token) = transfer.token.as_ref() {
                                     let _ = loop_handle.enable(token);
-                                } else {
-                                    selection.incoming.remove(&n.window);
                                 }
+                            }
+                            Err(err) => {
+                                warn!(?err, "Could not read an incoming selection chunk");
+                                selection.incoming.remove(&n.window).unwrap().destroy(loop_handle);
                             }
                         }
                     }
