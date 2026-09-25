@@ -42,7 +42,10 @@ use crate::{
     utils::{IsAlive, Logical, Point, Serial},
     xwayland::{
         X11Surface, XwmHandler,
-        xwm::{Atoms, OwnedX11Window, XwmId, atom_from_mime, mime_from_atom, selection::XWmSelection},
+        xwm::{
+            Atoms, OwnedX11Window, XwmId, atom_from_mime, mime_from_atom,
+            selection::{PendingTransfer, XWmSelection},
+        },
     },
 };
 
@@ -540,7 +543,7 @@ impl XWmDnd {
                 drag.pending_transfers
                     .lock()
                     .unwrap()
-                    .insert(*drag.target, (drag.target.clone(), fd));
+                    .insert(*drag.target, PendingTransfer::new(drag.target.clone(), fd));
 
                 self.selection.conn.convert_selection(
                     drag.owner,
@@ -640,7 +643,7 @@ impl XWmDnd {
                 drag.pending_transfers
                     .lock()
                     .unwrap()
-                    .insert(*drag.target, (drag.target.clone(), fd));
+                    .insert(*drag.target, PendingTransfer::new(drag.target.clone(), fd));
 
                 let Some(atom) = atom_from_mime(&mime_type, &self.selection.conn, &self.selection.atoms)?
                 else {
@@ -725,7 +728,7 @@ pub struct XwmActiveDrag {
     owner: X11Window,
 
     state: Arc<Mutex<XwmSourceState>>,
-    pending_transfers: Arc<Mutex<HashMap<X11Window, (OwnedX11Window, OwnedFd)>>>,
+    pending_transfers: Arc<Mutex<HashMap<X11Window, PendingTransfer>>>,
 }
 
 #[derive(Debug)]
@@ -737,7 +740,7 @@ pub struct XwmDndSource {
     target: OwnedX11Window,
 
     state: Arc<Mutex<XwmSourceState>>,
-    pending_transfers: Arc<Mutex<HashMap<X11Window, (OwnedX11Window, OwnedFd)>>>,
+    pending_transfers: Arc<Mutex<HashMap<X11Window, PendingTransfer>>>,
 }
 
 impl Drop for XwmDndSource {
@@ -792,7 +795,7 @@ impl Source for XwmDndSource {
                 self.pending_transfers
                     .lock()
                     .unwrap()
-                    .insert(*self.target, (self.target.clone(), fd));
+                    .insert(*self.target, PendingTransfer::new(self.target.clone(), fd));
 
                 if let Err(err) = conn.convert_selection(
                     *self.target,

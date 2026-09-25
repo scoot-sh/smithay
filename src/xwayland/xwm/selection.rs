@@ -48,10 +48,45 @@ pub const MAX_SELECTION_TRANSFERS: usize = 8;
 /// [`X11Wm::set_selection_transfer_timeout`](super::X11Wm::set_selection_transfer_timeout).
 pub const SELECTION_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// When a selection changes hands, a transfer still waiting on the previous owner for its next
-/// chunk -- and idle for at least this long -- is dropped. One that is moving is left to
-/// finish: ending it would hand the reader a partial selection as if it were whole.
+/// Once a selection has changed hands (or its owner has gone), a transfer started under the
+/// previous owner that is waiting on it for its next chunk, idle for at least this long, is
+/// dropped. One that is still moving is left to finish: ending it would hand the reader a
+/// partial selection as if it were whole.
 pub const OWNER_CHANGE_GRACE: Duration = Duration::from_secs(1);
+
+/// How often the window manager sweeps selection transfers while any are in flight (the timer
+/// is not armed at all while none are).
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A conversion of an X selection, requested for a Wayland reader, that its owner has not
+/// answered yet.
+#[derive(Debug)]
+pub struct PendingTransfer {
+    pub window: OwnedX11Window,
+    /// The reader's end.
+    pub fd: OwnedFd,
+    pub since: Instant,
+}
+
+impl PendingTransfer {
+    pub fn new(window: OwnedX11Window, fd: OwnedFd) -> Self {
+        PendingTransfer {
+            window,
+            fd,
+            since: Instant::now(),
+        }
+    }
+}
+
+/// Whether the reader holding the other end of the pipe `fd` writes into has closed it: the
+/// pipe reports an error or hang-up.
+fn reader_gone(fd: &OwnedFd) -> bool {
+    let mut fds = [PollFd::new(fd, PollFlags::OUT)];
+    match poll(&mut fds, Some(&Timespec::default())) {
+        Ok(_) => fds[0].revents().intersects(PollFlags::ERR | PollFlags::HUP),
+        Err(_) => false,
+    }
+}
 
 /// The most transfers out of one selection (a Wayland selection read by X clients) one X client
 /// may have in flight at once. Each holds a pipe and up to two chunks of data until the
@@ -81,7 +116,7 @@ pub struct XWmSelection {
     pub mime_types: Vec<String>,
     pub timestamp: u32,
 
-    pub pending_transfers: Arc<Mutex<HashMap<X11Window, (OwnedX11Window, OwnedFd)>>>,
+    pub pending_transfers: Arc<Mutex<HashMap<X11Window, PendingTransfer>>>,
     pub incoming: HashMap<X11Window, IncomingTransfer>,
     pub outgoing: HashMap<X11Window, OutgoingTransfer>,
 }
@@ -108,6 +143,9 @@ pub struct IncomingTransfer {
     pub awaiting_chunk: bool,
     /// When the transfer last moved: a slice read, bytes written, a chunk arriving.
     pub last_activity: Instant,
+    /// The selection's ownership count when the transfer was answered: a transfer whose owner
+    /// has since changed or gone can stall for good.
+    pub generation: u64,
 }
 
 impl fmt::Debug for IncomingTransfer {
@@ -127,7 +165,7 @@ impl fmt::Debug for IncomingTransfer {
 
 impl IncomingTransfer {
     /// A transfer into `fd` through `window`, not started.
-    pub fn new(token: RegistrationToken, window: OwnedX11Window, fd: Arc<OwnedFd>) -> Self {
+    pub fn new(token: RegistrationToken, window: OwnedX11Window, fd: Arc<OwnedFd>, generation: u64) -> Self {
         IncomingTransfer {
             token: Some(token),
             window,
@@ -139,6 +177,7 @@ impl IncomingTransfer {
             delete_sent: false,
             awaiting_chunk: false,
             last_activity: Instant::now(),
+            generation,
         }
     }
 
@@ -187,11 +226,7 @@ impl IncomingTransfer {
     /// Whether the reader has closed its end: the pipe reports an error or hang-up. A transfer
     /// waiting on its owner writes nothing, so without asking it would never notice.
     pub fn reader_gone(&self) -> bool {
-        let mut fds = [PollFd::new(&*self.fd, PollFlags::OUT)];
-        match poll(&mut fds, Some(&Timespec::default())) {
-            Ok(_) => fds[0].revents().intersects(PollFlags::ERR | PollFlags::HUP),
-            Err(_) => false,
-        }
+        reader_gone(&self.fd)
     }
 
     /// Whether the transfer is waiting on the owner for its next chunk.
@@ -340,19 +375,32 @@ impl XWmSelection {
         })
     }
 
-    /// Drops the transfers that will not finish: incoming ones whose reader has left or that
-    /// have not moved for `timeout`, outgoing ones that have not moved for `timeout`, and --
-    /// when the selection has just changed hands -- incoming ones idle past
-    /// [`OWNER_CHANGE_GRACE`] while they wait on the previous owner for a chunk.
-    pub fn sweep<D>(&mut self, timeout: Duration, owner_changed: bool, loop_handle: &LoopHandle<'_, D>) {
+    /// Drops the transfers that will not finish, and says whether any are left:
+    ///
+    /// - a conversion waiting on its owner whose reader has left, or that has waited for
+    ///   `timeout`;
+    /// - an incoming transfer whose reader has left, that has not moved for `timeout`, or that
+    ///   is waiting on its owner for a chunk, idle past [`OWNER_CHANGE_GRACE`], after the
+    ///   selection has changed hands (or lost its owner) since it was answered;
+    /// - an outgoing transfer that has not moved for `timeout`.
+    pub fn sweep<D>(&mut self, timeout: Duration, loop_handle: &LoopHandle<'_, D>) -> bool {
         let now = Instant::now();
+        let generation = self.generation;
+        {
+            let mut pending = self.pending_transfers.lock().unwrap();
+            pending.retain(|_, transfer| {
+                now.saturating_duration_since(transfer.since) < timeout && !reader_gone(&transfer.fd)
+            });
+        }
         let stale: SmallVec<[X11Window; 8]> = self
             .incoming
             .iter()
             .filter(|(_, transfer)| {
                 let idle = now.saturating_duration_since(transfer.last_activity);
                 idle >= timeout
-                    || (owner_changed && transfer.waiting_on_owner() && idle >= OWNER_CHANGE_GRACE)
+                    || (transfer.generation != generation
+                        && transfer.waiting_on_owner()
+                        && idle >= OWNER_CHANGE_GRACE)
                     || transfer.reader_gone()
             })
             .map(|(window, _)| *window)
@@ -378,6 +426,9 @@ impl XWmSelection {
                 transfer.destroy(loop_handle);
             }
         }
+        !self.incoming.is_empty()
+            || !self.outgoing.is_empty()
+            || !self.pending_transfers.lock().unwrap().is_empty()
     }
 
     pub fn window_destroyed<D>(&mut self, window: &X11Window, loop_handle: &LoopHandle<'_, D>) -> bool {

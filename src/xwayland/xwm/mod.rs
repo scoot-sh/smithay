@@ -145,7 +145,12 @@ use crate::{
         xwayland_shell::{self, XWaylandShellHandler},
     },
 };
-use calloop::{Interest, LoopHandle, Mode, PostAction, generic::Generic, ping};
+use calloop::{
+    Interest, LoopHandle, Mode, PostAction,
+    generic::Generic,
+    ping,
+    timer::{TimeoutAction, Timer},
+};
 use portable_atomic::AtomicF64;
 use rustix::fs::OFlags;
 use std::{
@@ -642,6 +647,10 @@ pub struct X11Wm {
 
     is_showing_desktop: bool,
     selection_transfer_timeout: Duration,
+    /// Wakes the loop to arm the selection sweep timer (see `arm_selection_sweep`).
+    sweep_ping: ping::Ping,
+    /// The sweep timer is armed: it re-arms itself while transfers are in flight.
+    sweep_armed: bool,
 
     pub(super) focus_release: FocusReleaseHandle,
 
@@ -1045,6 +1054,14 @@ impl X11Wm {
         let dnd = XWmDnd::new(&conn, &screen, &atoms)?;
         let wm_window = OwnedX11Window::new(win, &conn);
 
+        let (sweep_ping, sweep_source) = ping::make_ping()?;
+        {
+            let timer_handle = handle.clone();
+            handle.insert_source(sweep_source, move |_, _, data: &mut D| {
+                arm_selection_sweep(data, id, &timer_handle);
+            })?;
+        }
+
         let (focus_release, focus_release_source) = FocusReleaseHandle::new(&conn)?;
         {
             let release = focus_release.clone();
@@ -1074,6 +1091,8 @@ impl X11Wm {
             client_list_stacking: Vec::new(),
             is_showing_desktop: false,
             selection_transfer_timeout: SELECTION_TRANSFER_TIMEOUT,
+            sweep_ping,
+            sweep_armed: false,
             focus_release,
             span,
         };
@@ -1443,8 +1462,9 @@ impl X11Wm {
 
         selection.pending_transfers.lock().unwrap().insert(
             incoming_window,
-            (OwnedX11Window::new(incoming_window, &self.conn), fd),
+            PendingTransfer::new(OwnedX11Window::new(incoming_window, &self.conn), fd),
         );
+        self.sweep_ping.ping();
         Ok(())
     }
 
@@ -2012,7 +2032,7 @@ where
             // answers only requests made to it. Dropping the reader's fd ends that read. So are
             // the transfers that have stalled waiting on its next chunk.
             selection.pending_transfers.lock().unwrap().clear();
-            selection.sweep(xwm.selection_transfer_timeout, true, loop_handle);
+            selection.sweep(xwm.selection_transfer_timeout, loop_handle);
             if selection.owner == *selection.window {
                 selection.timestamp = n.timestamp;
                 return Ok(());
@@ -2087,7 +2107,8 @@ where
                         debug!(requestor = n.requestor, "Ignoring a repeated SelectionNotify");
                         return Ok(());
                     }
-                    let Some((window, fd)) = selection.pending_transfers.lock().unwrap().remove(&n.requestor)
+                    let Some(PendingTransfer { window, fd, .. }) =
+                        selection.pending_transfers.lock().unwrap().remove(&n.requestor)
                     else {
                         // no file descriptor for incoming transfer
                         warn!(
@@ -2100,7 +2121,7 @@ where
                         // Refused: dropping the fd is the reader's end of file.
                         return Ok(());
                     }
-                    selection.sweep(xwm.selection_transfer_timeout, false, loop_handle);
+                    selection.sweep(xwm.selection_transfer_timeout, loop_handle);
                     if selection.incoming.len() >= MAX_SELECTION_TRANSFERS {
                         // Refused, not queued: the reader sees an empty transfer.
                         debug!(
@@ -2150,7 +2171,7 @@ where
                         .map_err(|err| err.error)?;
                     loop_handle.disable(&token)?;
 
-                    let mut transfer = IncomingTransfer::new(token, window, fd);
+                    let mut transfer = IncomingTransfer::new(token, window, fd, selection.generation);
                     match transfer.read_slice(&conn, &xwm.atoms) {
                         Ok(type_) if type_ == xwm.atoms.INCR => {
                             // The INCR announcement: its value is a size, not data. Deleting it
@@ -2305,7 +2326,7 @@ where
                         // likes (review of scoot PR #246: 300 windows, 300 fds, held until the
                         // client quit). Bounded per X client -- the client bits of the
                         // requestor's window id, which the server allocates -- and in total.
-                        selection.sweep(xwm.selection_transfer_timeout, false, loop_handle);
+                        selection.sweep(xwm.selection_transfer_timeout, loop_handle);
                         let client_mask = !conn.setup().resource_id_mask;
                         let client = n.requestor & client_mask;
                         let from_client = selection
@@ -2407,6 +2428,7 @@ where
                             last_activity: Instant::now(),
                         };
                         selection.outgoing.insert(n.requestor, transfer);
+                        xwm.sweep_ping.ping();
 
                         let selection_type = selection.type_();
                         drop(_guard);
@@ -2951,6 +2973,40 @@ where
     }
     conn.flush()?;
     Ok(())
+}
+
+/// Arms the timer that sweeps selection transfers (see `XWmSelection::sweep`), unless it is
+/// armed already. It re-arms itself every [`SWEEP_INTERVAL`] while any transfer is in flight
+/// and drops itself once none is, so an idle window manager has no timer at all. Without it a
+/// transfer that will not finish -- an owner gone mid-transfer, a reader gone while waiting on
+/// the owner -- was only noticed when some other selection event happened to arrive.
+fn arm_selection_sweep<D: XwmHandler + 'static>(data: &mut D, id: XwmId, handle: &LoopHandle<'static, D>) {
+    let xwm = data.xwm_state(id);
+    if xwm.id != id || xwm.sweep_armed {
+        return;
+    }
+    let timer_handle = handle.clone();
+    let armed = handle.insert_source(Timer::from_duration(SWEEP_INTERVAL), move |_, _, data| {
+        let xwm = data.xwm_state(id);
+        if xwm.id != id {
+            // A newer window manager: this one's transfers went with it.
+            return TimeoutAction::Drop;
+        }
+        let timeout = xwm.selection_transfer_timeout;
+        let mut left = xwm.clipboard.sweep(timeout, &timer_handle);
+        left |= xwm.primary.sweep(timeout, &timer_handle);
+        left |= xwm.dnd.selection.sweep(timeout, &timer_handle);
+        if left {
+            TimeoutAction::ToDuration(SWEEP_INTERVAL)
+        } else {
+            xwm.sweep_armed = false;
+            TimeoutAction::Drop
+        }
+    });
+    match armed {
+        Ok(_) => xwm.sweep_armed = true,
+        Err(err) => warn!(?err, "Could not arm the selection sweep"),
+    }
 }
 
 fn send_configure_notify(
