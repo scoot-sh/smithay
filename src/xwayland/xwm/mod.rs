@@ -135,11 +135,11 @@
 
 use crate::{
     input::{
-        SeatHandler,
-        dnd::{DndFocus, DndGrabHandler},
+        Seat, SeatHandler,
+        dnd::{DndFocus, DndGrabHandler, GrabType},
     },
     output::Output,
-    utils::{Client, Logical, Point, Rectangle, Size, x11rb::X11Source},
+    utils::{Client, Logical, Point, Rectangle, Serial, Size, x11rb::X11Source},
     wayland::{
         selection::SelectionTarget,
         xwayland_shell::{self, XWaylandShellHandler},
@@ -565,6 +565,30 @@ pub trait XwmHandler {
     /// A proviously set selection of an X client got cleared
     fn cleared_selection(&mut self, xwm: XwmId, selection: SelectionTarget) {
         let _ = (xwm, selection);
+    }
+
+    /// An X client took the `XdndSelection` while a pointer button or touch point is held:
+    /// it is starting a drag from that press, which the window manager would turn into a
+    /// drag-and-drop grab on `seat` -- the grab `serial` names, of kind `grab`. `owner` is
+    /// the X window that took the selection.
+    ///
+    /// Return `false` to refuse, and the press stays an ordinary press. The default allows
+    /// every such drag, which lets any X client turn any held press -- including one on
+    /// another client's surface -- into a drag of its own data; a compositor that validates
+    /// the serials of Wayland drags should apply the same check here.
+    fn allow_drag(
+        &mut self,
+        xwm: XwmId,
+        owner: X11Window,
+        seat: &Seat<Self>,
+        serial: Serial,
+        grab: GrabType,
+    ) -> bool
+    where
+        Self: SeatHandler + Sized,
+    {
+        let _ = (xwm, owner, seat, serial, grab);
+        true
     }
 
     /// The primary output of the randr protocol state was updated

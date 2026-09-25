@@ -36,7 +36,7 @@ use crate::{
     backend::input::InputTime,
     input::{
         Seat, SeatHandler,
-        dnd::{DnDGrab, DndAction, DndFocus, DndGrabHandler, OfferData, Source, SourceMetadata},
+        dnd::{DnDGrab, DndAction, DndFocus, DndGrabHandler, GrabType, OfferData, Source, SourceMetadata},
         pointer::Focus,
     },
     utils::{IsAlive, Logical, Point, Serial},
@@ -203,7 +203,15 @@ impl XWmDnd {
             })
             .max_by(|(_, s1, _), (_, s2, _)| s1.partial_cmp(s2).unwrap_or(cmp::Ordering::Equal));
 
-        if ptr_grab.is_none() && touch_grab.is_none() {
+        // The grab the drag would take over, chosen the same way as below.
+        let (seat, serial, grab) = match (&ptr_grab, &touch_grab) {
+            (Some((seat, s1, _)), Some((_, s2, _))) if s1 >= s2 => (seat.clone(), *s1, GrabType::Pointer),
+            (Some((seat, serial, _)), None) => (seat.clone(), *serial, GrabType::Pointer),
+            (_, Some((seat, serial, _))) => (seat.clone(), *serial, GrabType::Touch),
+            (None, None) => return Ok(()),
+        };
+        if !data.allow_drag(id, event.owner, &seat, serial, grab) {
+            debug!(owner = event.owner, ?serial, "Refused an XDND drag");
             return Ok(());
         }
 
