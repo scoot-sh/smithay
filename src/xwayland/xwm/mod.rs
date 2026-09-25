@@ -1285,6 +1285,22 @@ impl X11Wm {
         Ok(())
     }
 
+    /// The X window that owns `selection`, as the window manager last heard (XFixes):
+    /// `x11rb::NONE` when nobody does, and the window manager's own selection window while it
+    /// holds a Wayland selection for X clients.
+    ///
+    /// A Wayland read of an X selection ([`X11Wm::send_selection`]) is converted from whoever
+    /// owns it *now*. A compositor that gates which X owners may provide the Wayland selection
+    /// can compare this against the owner it accepted before serving a read -- an owner change
+    /// is not always followed by [`XwmHandler::new_selection`], which needs the new owner to
+    /// answer `TARGETS`.
+    pub fn selection_owner(&self, selection: SelectionTarget) -> X11Window {
+        match selection {
+            SelectionTarget::Clipboard => self.clipboard.owner,
+            SelectionTarget::Primary => self.primary.owner,
+        }
+    }
+
     /// Notify Xwayland of a new selection.
     ///
     /// `mime_types` being `None` indicate there is no active selection anymore.
