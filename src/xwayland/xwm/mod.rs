@@ -161,6 +161,7 @@ use std::{
         Arc, Weak,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 use tracing::{debug, debug_span, info, trace, warn};
 use wayland_server::{DisplayHandle, Resource};
@@ -640,6 +641,7 @@ pub struct X11Wm {
     client_list_stacking: Vec<X11Window>,
 
     is_showing_desktop: bool,
+    selection_transfer_timeout: Duration,
 
     pub(super) focus_release: FocusReleaseHandle,
 
@@ -1071,6 +1073,7 @@ impl X11Wm {
             client_list: Vec::new(),
             client_list_stacking: Vec::new(),
             is_showing_desktop: false,
+            selection_transfer_timeout: SELECTION_TRANSFER_TIMEOUT,
             focus_release,
             span,
         };
@@ -1345,6 +1348,13 @@ impl X11Wm {
         }
     }
 
+    /// How long a selection transfer (either way) may go without moving before it is dropped;
+    /// 30 seconds by default. Transfers are swept when the window manager
+    /// next handles one -- a new request or answer, or a change of owner -- not on a timer.
+    pub fn set_selection_transfer_timeout(&mut self, timeout: Duration) {
+        self.selection_transfer_timeout = timeout;
+    }
+
     /// Notify Xwayland of a new selection.
     ///
     /// `mime_types` being `None` indicate there is no active selection anymore.
@@ -1392,12 +1402,10 @@ impl X11Wm {
             "Send request from XWayland",
         );
 
-        // Every transfer holds the reader's fd and a window until the owner answers and the
-        // reader takes the data; an owner that never answers, or a reader that never reads,
-        // would otherwise let them pile up one per request.
-        if selection.pending_transfers.lock().unwrap().len() + selection.incoming.len()
-            >= MAX_SELECTION_TRANSFERS
-        {
+        // Every conversion holds the reader's fd and a window until the owner answers; an owner
+        // that never answers would otherwise let them pile up one per request. (Answered ones
+        // are bounded when the answer arrives, where stale ones can be swept first.)
+        if selection.pending_transfers.lock().unwrap().len() >= MAX_SELECTION_TRANSFERS {
             return Err(SelectionError::TooManyTransfers);
         }
 
@@ -2001,8 +2009,10 @@ where
             selection.owner = n.owner;
             selection.generation = selection.generation.wrapping_add(1);
             // A conversion still waiting on the previous owner is not coming: a new owner
-            // answers only requests made to it. Dropping the reader's fd ends that read.
+            // answers only requests made to it. Dropping the reader's fd ends that read. So are
+            // the transfers that have stalled waiting on its next chunk.
             selection.pending_transfers.lock().unwrap().clear();
+            selection.sweep(xwm.selection_transfer_timeout, true, loop_handle);
             if selection.owner == *selection.window {
                 selection.timestamp = n.timestamp;
                 return Ok(());
@@ -2090,13 +2100,23 @@ where
                         // Refused: dropping the fd is the reader's end of file.
                         return Ok(());
                     }
+                    selection.sweep(xwm.selection_transfer_timeout, false, loop_handle);
+                    if selection.incoming.len() >= MAX_SELECTION_TRANSFERS {
+                        // Refused, not queued: the reader sees an empty transfer.
+                        debug!(
+                            requestor = n.requestor,
+                            "Refusing an incoming selection transfer: too many under way"
+                        );
+                        return Ok(());
+                    }
+                    let fd = Arc::new(fd);
 
                     let loop_handle_clone = loop_handle.clone();
                     let incoming_window = *window;
                     let atom = n.selection;
                     let token = loop_handle
                         .insert_source(
-                            Generic::new(fd, Interest::WRITE, Mode::Level),
+                            Generic::new(fd.clone(), Interest::WRITE, Mode::Level),
                             move |_, fd, data| {
                                 let xwm = data.xwm_state(xwm_id);
                                 let conn = &xwm.conn;
@@ -2130,7 +2150,7 @@ where
                         .map_err(|err| err.error)?;
                     loop_handle.disable(&token)?;
 
-                    let mut transfer = IncomingTransfer::new(token, window);
+                    let mut transfer = IncomingTransfer::new(token, window, fd);
                     match transfer.read_slice(&conn, &xwm.atoms) {
                         Ok(type_) if type_ == xwm.atoms.INCR => {
                             // The INCR announcement: its value is a size, not data. Deleting it
@@ -2285,6 +2305,7 @@ where
                         // likes (review of scoot PR #246: 300 windows, 300 fds, held until the
                         // client quit). Bounded per X client -- the client bits of the
                         // requestor's window id, which the server allocates -- and in total.
+                        selection.sweep(xwm.selection_transfer_timeout, false, loop_handle);
                         let client_mask = !conn.setup().resource_id_mask;
                         let client = n.requestor & client_mask;
                         let from_client = selection
@@ -2383,6 +2404,7 @@ where
                             property_set: false,
                             flush_property_on_delete: false,
                             sent_finished: false,
+                            last_activity: Instant::now(),
                         };
                         selection.outgoing.insert(n.requestor, transfer);
 
@@ -2476,6 +2498,7 @@ where
                     let transfer = selection.outgoing.get_mut(&n.window).unwrap();
 
                     transfer.property_set = false;
+                    transfer.last_activity = Instant::now();
                     if transfer.flush_property_on_delete {
                         transfer.flush_property_on_delete = false;
                         let len = transfer.flush_data()?;

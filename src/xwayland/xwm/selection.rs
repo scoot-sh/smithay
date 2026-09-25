@@ -3,10 +3,15 @@ use std::{
     fmt,
     os::fd::{BorrowedFd, OwnedFd},
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use calloop::{LoopHandle, RegistrationToken};
+use rustix::{
+    event::{PollFd, PollFlags, poll},
+    time::Timespec,
+};
+use smallvec::SmallVec;
 use tracing::{debug, trace, warn};
 use x11rb::{
     connection::Connection as _,
@@ -31,11 +36,22 @@ use crate::{
 // and there is no way to query the maximum size, you just get a non-descriptive `Length` error...
 pub const INCR_CHUNK_SIZE: usize = 64 * 1024;
 
-/// The most transfers of one selection into Wayland clients that may be in flight at once --
-/// waiting on the X owner, or on the reader. Each holds a file descriptor and a window, and an
-/// answered one up to a whole selection property; a paste and a clipboard manager reading
-/// together is the usual worst case.
+/// The most transfers of one selection into Wayland clients that may wait on their X owner's
+/// answer at once, and separately the most that may be under way (answered, streaming to their
+/// reader) at once. Each holds a file descriptor and a window, and an answered one a slice of
+/// data; a paste and a clipboard manager reading together is the usual worst case. A read past
+/// either bound is refused -- the reader sees an empty transfer -- not queued.
 pub const MAX_SELECTION_TRANSFERS: usize = 8;
+
+/// A transfer, either way, that has not moved for this long is dropped the next time the window
+/// manager looks (a new request, a new answer, a change of owner). The default for
+/// [`X11Wm::set_selection_transfer_timeout`](super::X11Wm::set_selection_transfer_timeout).
+pub const SELECTION_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// When a selection changes hands, a transfer still waiting on the previous owner for its next
+/// chunk -- and idle for at least this long -- is dropped. One that is moving is left to
+/// finish: ending it would hand the reader a partial selection as if it were whole.
+pub const OWNER_CHANGE_GRACE: Duration = Duration::from_secs(1);
 
 /// The most transfers out of one selection (a Wayland selection read by X clients) one X client
 /// may have in flight at once. Each holds a pipe and up to two chunks of data until the
@@ -73,6 +89,8 @@ pub struct XWmSelection {
 pub struct IncomingTransfer {
     pub token: Option<RegistrationToken>,
     pub window: OwnedX11Window,
+    /// The reader's end, shared with the write source, so a sweep can see a reader that left.
+    pub fd: Arc<OwnedFd>,
 
     pub incr: bool,
     /// Read from the property, not yet written to the reader: at most one slice.
@@ -109,10 +127,11 @@ impl fmt::Debug for IncomingTransfer {
 
 impl IncomingTransfer {
     /// A transfer into `fd` through `window`, not started.
-    pub fn new(token: RegistrationToken, window: OwnedX11Window) -> Self {
+    pub fn new(token: RegistrationToken, window: OwnedX11Window, fd: Arc<OwnedFd>) -> Self {
         IncomingTransfer {
             token: Some(token),
             window,
+            fd,
             incr: false,
             source_data: Vec::new(),
             offset: 0,
@@ -164,6 +183,21 @@ impl IncomingTransfer {
             handle.remove(token);
         }
     }
+
+    /// Whether the reader has closed its end: the pipe reports an error or hang-up. A transfer
+    /// waiting on its owner writes nothing, so without asking it would never notice.
+    pub fn reader_gone(&self) -> bool {
+        let mut fds = [PollFd::new(&*self.fd, PollFlags::OUT)];
+        match poll(&mut fds, Some(&Timespec::default())) {
+            Ok(_) => fds[0].revents().intersects(PollFlags::ERR | PollFlags::HUP),
+            Err(_) => false,
+        }
+    }
+
+    /// Whether the transfer is waiting on the owner for its next chunk.
+    pub fn waiting_on_owner(&self) -> bool {
+        self.delete_sent || self.awaiting_chunk
+    }
 }
 
 impl Drop for IncomingTransfer {
@@ -189,6 +223,8 @@ pub struct OutgoingTransfer {
     pub flush_property_on_delete: bool,
     /// The final 0-byte data chunk has been sent, denoting the completion of this transfer
     pub sent_finished: bool,
+    /// When the transfer last moved: bytes read from the source, or a chunk taken.
+    pub last_activity: Instant,
 }
 
 impl fmt::Debug for OutgoingTransfer {
@@ -304,6 +340,46 @@ impl XWmSelection {
         })
     }
 
+    /// Drops the transfers that will not finish: incoming ones whose reader has left or that
+    /// have not moved for `timeout`, outgoing ones that have not moved for `timeout`, and --
+    /// when the selection has just changed hands -- incoming ones idle past
+    /// [`OWNER_CHANGE_GRACE`] while they wait on the previous owner for a chunk.
+    pub fn sweep<D>(&mut self, timeout: Duration, owner_changed: bool, loop_handle: &LoopHandle<'_, D>) {
+        let now = Instant::now();
+        let stale: SmallVec<[X11Window; 8]> = self
+            .incoming
+            .iter()
+            .filter(|(_, transfer)| {
+                let idle = now.saturating_duration_since(transfer.last_activity);
+                idle >= timeout
+                    || (owner_changed && transfer.waiting_on_owner() && idle >= OWNER_CHANGE_GRACE)
+                    || transfer.reader_gone()
+            })
+            .map(|(window, _)| *window)
+            .collect();
+        for window in stale {
+            if let Some(transfer) = self.incoming.remove(&window) {
+                debug!(
+                    ?transfer,
+                    "Dropping an incoming selection transfer that will not finish"
+                );
+                transfer.destroy(loop_handle);
+            }
+        }
+        let stale: SmallVec<[X11Window; 8]> = self
+            .outgoing
+            .iter()
+            .filter(|(_, transfer)| now.saturating_duration_since(transfer.last_activity) >= timeout)
+            .map(|(window, _)| *window)
+            .collect();
+        for window in stale {
+            if let Some(transfer) = self.outgoing.remove(&window) {
+                debug!(requestor = window, "Dropping an idle outgoing selection transfer");
+                transfer.destroy(loop_handle);
+            }
+        }
+    }
+
     pub fn window_destroyed<D>(&mut self, window: &X11Window, loop_handle: &LoopHandle<'_, D>) -> bool {
         (if let Some(transfer) = self.incoming.remove(window) {
             transfer.destroy(loop_handle);
@@ -372,6 +448,7 @@ pub fn read_selection_callback(
     );
 
     transfer.source_data.extend_from_slice(&buf[..len]);
+    transfer.last_activity = Instant::now();
     if transfer.source_data.len() >= INCR_CHUNK_SIZE {
         if !transfer.incr {
             // start incr transfer
