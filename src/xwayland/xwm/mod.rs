@@ -1350,6 +1350,9 @@ impl X11Wm {
             self.conn
                 .set_selection_owner(x11rb::NONE, selection.atom, selection.timestamp)?;
         }
+        // Sent now: until the server has it, X clients reading the selection still reach the
+        // previous owner.
+        self.conn.flush()?;
 
         Ok(())
     }
