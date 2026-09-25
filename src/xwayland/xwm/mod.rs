@@ -2264,17 +2264,6 @@ where
                             return Ok(());
                         }
 
-                        // Only our end is non-blocking. The write end goes to the Wayland
-                        // client serving the selection, and `O_NONBLOCK` lives on the open
-                        // file description, so setting it on the pipe would hand that client
-                        // a non-blocking fd it never asked for -- a client writing with plain
-                        // blocking `write` then fails with `EAGAIN` as soon as the pipe fills
-                        // and ends the transfer early (measured: 64 KiB of a 2 MiB selection).
-                        let (recv_fd, send_fd) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
-                            .map_err(|err| ConnectionError::IoError(std::io::Error::from(err)))?;
-                        rustix::fs::fcntl_setfl(&recv_fd, OFlags::NONBLOCK)
-                            .map_err(|err| ConnectionError::IoError(std::io::Error::from(err)))?;
-
                         // It seems that if we ever try to reply to a selection request after
                         // another has been sent by the same requestor, the requestor never reads
                         // from it. It appears to only ever read from the latest, so purge stale
@@ -2290,6 +2279,42 @@ where
                                 transfer.destroy(loop_handle);
                             }
                         }
+
+                        // Every transfer holds a pipe and up to two chunks until the requestor
+                        // has taken it all, and any X client can ask from as many windows as it
+                        // likes (review of scoot PR #246: 300 windows, 300 fds, held until the
+                        // client quit). Bounded per X client -- the client bits of the
+                        // requestor's window id, which the server allocates -- and in total.
+                        let client_mask = !conn.setup().resource_id_mask;
+                        let client = n.requestor & client_mask;
+                        let from_client = selection
+                            .outgoing
+                            .keys()
+                            .filter(|requestor| **requestor & client_mask == client)
+                            .count();
+                        if from_client >= MAX_OUTGOING_PER_CLIENT
+                            || selection.outgoing.len() >= MAX_OUTGOING_TRANSFERS
+                        {
+                            debug!(
+                                requestor = n.requestor,
+                                from_client,
+                                total = selection.outgoing.len(),
+                                "Refusing a selection request: too many transfers in flight"
+                            );
+                            send_selection_notify_resp(&conn, &n, false)?;
+                            return Ok(());
+                        }
+
+                        // Only our end is non-blocking. The write end goes to the Wayland
+                        // client serving the selection, and `O_NONBLOCK` lives on the open
+                        // file description, so setting it on the pipe would hand that client
+                        // a non-blocking fd it never asked for -- a client writing with plain
+                        // blocking `write` then fails with `EAGAIN` as soon as the pipe fills
+                        // and ends the transfer early (measured: 64 KiB of a 2 MiB selection).
+                        let (recv_fd, send_fd) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
+                            .map_err(|err| ConnectionError::IoError(std::io::Error::from(err)))?;
+                        rustix::fs::fcntl_setfl(&recv_fd, OFlags::NONBLOCK)
+                            .map_err(|err| ConnectionError::IoError(std::io::Error::from(err)))?;
 
                         let requestor = n.requestor;
                         let atom = selection.atom;

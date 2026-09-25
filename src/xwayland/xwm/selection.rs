@@ -37,6 +37,14 @@ pub const INCR_CHUNK_SIZE: usize = 64 * 1024;
 /// together is the usual worst case.
 pub const MAX_SELECTION_TRANSFERS: usize = 8;
 
+/// The most transfers out of one selection (a Wayland selection read by X clients) one X client
+/// may have in flight at once. Each holds a pipe and up to two chunks of data until the
+/// requestor has taken it; a client pasting reads one or two targets at a time.
+pub const MAX_OUTGOING_PER_CLIENT: usize = 4;
+
+/// The most transfers out of one selection in flight at once, across all X clients.
+pub const MAX_OUTGOING_TRANSFERS: usize = 16;
+
 /// How much of a selection property an incoming transfer reads at a time, in 32-bit units
 /// (`GetProperty` counts in those): one [`INCR_CHUNK_SIZE`]. The next slice is read only once
 /// this one has been written into the reader's pipe, so a transfer never buffers more than one
