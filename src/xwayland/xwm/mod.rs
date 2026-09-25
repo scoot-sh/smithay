@@ -726,6 +726,9 @@ pub enum SelectionError {
     /// Unable to determine internal Atom for given mime-type
     #[error("Unable to determine ATOM matching mime-type")]
     UnableToDetermineAtom,
+    /// Too many transfers of this selection are already in flight
+    #[error("Too many transfers of this selection are already in flight")]
+    TooManyTransfers,
 }
 
 impl From<ConnectionError> for SelectionError {
@@ -1369,6 +1372,15 @@ impl X11Wm {
             "Send request from XWayland",
         );
 
+        // Every transfer holds the reader's fd and a window until the owner answers and the
+        // reader takes the data; an owner that never answers, or a reader that never reads,
+        // would otherwise let them pile up one per request.
+        if selection.pending_transfers.lock().unwrap().len() + selection.incoming.len()
+            >= MAX_SELECTION_TRANSFERS
+        {
+            return Err(SelectionError::TooManyTransfers);
+        }
+
         let atom = atom_from_mime(&mime_type, &self.conn, &self.atoms)?
             .ok_or(SelectionError::UnableToDetermineAtom)?;
 
@@ -1967,6 +1979,9 @@ where
             };
 
             selection.owner = n.owner;
+            // A conversion still waiting on the previous owner is not coming: a new owner
+            // answers only requests made to it. Dropping the reader's fd ends that read.
+            selection.pending_transfers.lock().unwrap().clear();
             if selection.owner == *selection.window {
                 selection.timestamp = n.timestamp;
                 return Ok(());

@@ -31,6 +31,12 @@ use crate::{
 // and there is no way to query the maximum size, you just get a non-descriptive `Length` error...
 pub const INCR_CHUNK_SIZE: usize = 64 * 1024;
 
+/// The most transfers of one selection into Wayland clients that may be in flight at once --
+/// waiting on the X owner, or on the reader. Each holds a file descriptor and a window, and an
+/// answered one up to a whole selection property; a paste and a clipboard manager reading
+/// together is the usual worst case.
+pub const MAX_SELECTION_TRANSFERS: usize = 8;
+
 #[derive(Debug)]
 pub struct XWmSelection {
     pub atom: Atom,
