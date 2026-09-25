@@ -354,7 +354,10 @@ pub fn write_selection_callback(
     match transfer.write_selection(fd) {
         Ok(true) => {
             if transfer.incr {
+                // This delete asks the owner for the next chunk (the read did not delete), so
+                // it has to reach the server now, not whenever something else flushes.
                 conn.delete_property(*transfer.window, atoms._WL_SELECTION)?;
+                conn.flush()?;
                 Ok(IncomingAction::WaitForProperty)
             } else {
                 debug!(?transfer, "Non-Incr Transfer complete!");
@@ -367,6 +370,7 @@ pub fn write_selection_callback(
             if transfer.incr {
                 // even if it failed, we still need to drain the incr transfer
                 conn.delete_property(*transfer.window, atoms._WL_SELECTION)?;
+                conn.flush()?;
                 Ok(IncomingAction::WaitForProperty)
             } else {
                 Ok(IncomingAction::Done)

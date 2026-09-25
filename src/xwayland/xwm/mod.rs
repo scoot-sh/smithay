@@ -2308,9 +2308,15 @@ where
                 } {
                     let transfer = selection.incoming.get_mut(&n.window).unwrap();
                     if transfer.incr {
+                        // Read without deleting: the delete is what asks the owner for the
+                        // next chunk, so it is sent only once this chunk has been written
+                        // out (`write_selection_callback`). Deleting here as well let the
+                        // owner's next chunk arrive before that second delete, which then
+                        // removed it unread -- the transfer ended after one chunk -- and
+                        // left nothing pacing the owner against a slow reader.
                         if let Some(prop) = conn
                             .get_property(
-                                true,
+                                false,
                                 *transfer.window,
                                 xwm.atoms._WL_SELECTION,
                                 AtomEnum::ANY,
