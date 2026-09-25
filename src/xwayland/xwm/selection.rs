@@ -45,6 +45,9 @@ pub struct XWmSelection {
     pub atoms: Atoms,
     pub window: OwnedX11Window,
     pub owner: X11Window,
+    /// Bumped on every ownership change the window manager hears of (see
+    /// [`X11Wm::selection_generation`](super::X11Wm::selection_generation)).
+    pub generation: u64,
     pub mime_types: Vec<String>,
     pub timestamp: u32,
 
@@ -226,6 +229,7 @@ impl XWmSelection {
             atoms: *atoms,
             window: OwnedX11Window::new(window, conn),
             owner: x11rb::NONE,
+            generation: 0,
             mime_types: Vec::new(),
             timestamp: x11rb::CURRENT_TIME,
             pending_transfers: Arc::new(Mutex::new(HashMap::new())),

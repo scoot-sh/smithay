@@ -1328,6 +1328,23 @@ impl X11Wm {
         }
     }
 
+    /// A counter bumped every time the window manager hears that `selection` changed hands
+    /// (each XFixes set-owner notify), whoever took it and whichever window they named.
+    ///
+    /// [`X11Wm::selection_owner`] alone cannot tell a compositor that the owner it accepted is
+    /// still the one serving: `SetSelectionOwner` accepts any window id, including another
+    /// client's, and conversions go to the client that made the request, not to the window's
+    /// creator. A client can therefore take a selection under the current owner's own window
+    /// id, and the tracked owner does not change. The re-claim is still an ownership change,
+    /// so it moves this counter: a compositor that records it when it accepts an owner and
+    /// compares it before serving a read notices any re-claim in between.
+    pub fn selection_generation(&self, selection: SelectionTarget) -> u64 {
+        match selection {
+            SelectionTarget::Clipboard => self.clipboard.generation,
+            SelectionTarget::Primary => self.primary.generation,
+        }
+    }
+
     /// Notify Xwayland of a new selection.
     ///
     /// `mime_types` being `None` indicate there is no active selection anymore.
@@ -1982,6 +1999,7 @@ where
             };
 
             selection.owner = n.owner;
+            selection.generation = selection.generation.wrapping_add(1);
             // A conversion still waiting on the previous owner is not coming: a new owner
             // answers only requests made to it. Dropping the reader's fd ends that read.
             selection.pending_transfers.lock().unwrap().clear();
