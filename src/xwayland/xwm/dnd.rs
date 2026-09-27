@@ -40,6 +40,7 @@ use crate::{
         pointer::Focus,
     },
     utils::{IsAlive, Logical, Point, Serial},
+    wayland::seat::WaylandFocus,
     xwayland::{
         X11Surface, XwmHandler,
         xwm::{
@@ -258,6 +259,18 @@ impl XWmDnd {
                 return Ok(());
             }
         };
+        // The surface the drag's press or touch started on, to find its X
+        // window once the drag is allowed.
+        let origin_surface = match grab {
+            GrabType::Pointer => ptr_grab
+                .as_ref()
+                .and_then(|(_, _, start_data)| start_data.focus.as_ref())
+                .and_then(|(focus, _)| focus.wl_surface().map(|surface| surface.into_owned())),
+            GrabType::Touch => touch_grab
+                .as_ref()
+                .and_then(|(_, _, start_data)| start_data.focus.as_ref())
+                .and_then(|(focus, _)| focus.wl_surface().map(|surface| surface.into_owned())),
+        };
         if !data.allow_drag(id, event.owner, &seat, serial, grab) {
             debug!(owner = event.owner, ?serial, "Refused an XDND drag");
             if pending_drop {
@@ -337,9 +350,16 @@ impl XWmDnd {
             state: state.clone(),
             pending_transfers: xwm.dnd.selection.pending_transfers.clone(),
         };
+        let origin = origin_surface.and_then(|surface| {
+            xwm.windows
+                .iter()
+                .find(|window| window.wl_surface().is_some_and(|own| own == surface))
+                .map(X11Surface::window_id)
+        });
         xwm.dnd.active_drag = Some(XwmActiveDrag {
             target: window,
             owner: xwm.dnd.selection.owner,
+            origin,
             state,
             pending_transfers: xwm.dnd.selection.pending_transfers.clone(),
         });
@@ -809,6 +829,10 @@ struct XwmSourceState {
 pub struct XwmActiveDrag {
     target: OwnedX11Window,
     owner: X11Window,
+    /// The X window the drag's press started on, when the grab's start
+    /// focus names one. The drag waits for the source's types only over it
+    /// (see `X11Surface::enter_needs_metadata`).
+    origin: Option<X11Window>,
 
     state: Arc<Mutex<XwmSourceState>>,
     pending_transfers: Arc<Mutex<HashMap<X11Window, PendingTransfer>>>,
@@ -1292,9 +1316,9 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
     /// it finds its own window and names nothing; waiting kept the proxy
     /// over another client's window on the drag's first motion onto it, the
     /// source found the proxy there, and a release before the next motion
-    /// dropped nothing. Only the source's own windows wait, and only while
-    /// it has named no types: the proxy stays over them until it does, which
-    /// the drag needs before it can enter a Wayland window.
+    /// dropped nothing. Only the window the drag started on waits, and only
+    /// while the source has named no types: the proxy stays over it until it
+    /// does, which the drag needs before it can enter a Wayland window.
     ///
     /// Not waiting also has `DnDGrab` enter the window before leaving the
     /// one the drag was over, so a drag between two X windows never maps the
@@ -1310,8 +1334,21 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
         let Some(active_drag) = xwm.dnd.active_drag.as_ref() else {
             return true;
         };
-        let client_mask = !xwm.conn.setup().resource_id_mask;
-        active_drag.owner & client_mask == self.window_id() & client_mask
+        // Wait only over the window the drag started on: the proxy has to
+        // stay over it until the source names its types, which the drag
+        // needs to enter a Wayland window. Another window -- another app's,
+        // or another of the same app instance's (single-instance apps run
+        // every window on one X connection) -- is entered at once. When the
+        // start focus named no X window, every window of the owner's client
+        // waits, as before.
+        let over_origin = match active_drag.origin {
+            Some(origin) => origin == self.window_id(),
+            None => {
+                let client_mask = !xwm.conn.setup().resource_id_mask;
+                active_drag.owner & client_mask == self.window_id() & client_mask
+            }
+        };
+        over_origin
             && source
                 .metadata()
                 .is_none_or(|metadata| metadata.mime_types.is_empty())
