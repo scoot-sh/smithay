@@ -316,7 +316,7 @@ impl XWmDnd {
         // create our dnd source
         let state = Arc::new(Mutex::new(XwmSourceState {
             mapped: true,
-            hovered: None,
+            entered: 0,
             x11: X11State::Active,
             wayland: WlState::Active,
             source: None,
@@ -790,8 +790,12 @@ struct XwmSourceState {
     source: Option<X11Window>,
 
     mapped: bool,
-    /// The X window the drag is over, if any: entered and not yet left.
-    hovered: Option<X11Window>,
+    /// X windows the drag has entered and not yet left. `DnDGrab` enters a
+    /// target offered nothing before leaving the old one, so this is 2 for
+    /// a moment while the drag crosses from one X window to the next --
+    /// including the same window under a new `wl_surface` (a remap) -- and
+    /// the proxy goes back only when it drops to 0.
+    entered: usize,
     pending_configure: Option<(u16, u16)>,
 
     active_action: DndAction,
@@ -1042,7 +1046,7 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
             if let Some(active_drag) = xwm.dnd.active_drag.as_mut() {
                 trace!("XDND grab entered X11Surface, unmapping proxy");
                 let mut drag_state = active_drag.state.lock().unwrap();
-                drag_state.hovered = Some(self.window_id());
+                drag_state.entered += 1;
                 if drag_state.mapped {
                     xwm.conn
                         .unmap_window(*active_drag.target)
@@ -1222,23 +1226,20 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
     fn leave<S: Source>(&self, data: &mut D, offer: Option<&mut XwmOfferData<S>>, _seat: &Seat<D>) {
         let Some(xwm_id) = self.xwm_id() else { return };
         let Some(offer) = offer else {
-            // remap the proxy
-            trace!("XDND grab left X11Surface, remapping proxy");
-
             let xwm = data.xwm_state(xwm_id);
             if let Some(active_drag) = xwm.dnd.active_drag.as_mut() {
                 let mut drag_state = active_drag.state.lock().unwrap();
-                if drag_state
-                    .hovered
-                    .is_some_and(|hovered| hovered != self.window_id())
-                {
+                drag_state.entered = drag_state.entered.saturating_sub(1);
+                if drag_state.entered > 0 {
                     // Another X window was entered first (`DnDGrab` enters a
                     // target offered nothing before leaving the old one): the
                     // proxy stays out of the X source's way.
+                    trace!("XDND grab left X11Surface for another, keeping proxy unmapped");
                     return;
                 }
-                drag_state.hovered = None;
                 if !drag_state.mapped {
+                    // remap the proxy
+                    trace!("XDND grab left X11Surface, remapping proxy");
                     if let Err(err) = xwm.conn.map_window(*active_drag.target) {
                         warn!("Unable to map proxy dnd window: {}", err);
                         return;
