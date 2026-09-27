@@ -162,8 +162,6 @@ impl RendererSurfaceState {
                     return;
                 }
                 self.buffer_has_alpha = buffer_has_alpha(&buffer);
-                self.buffer_scale = attrs.buffer_scale;
-                self.buffer_transform = attrs.buffer_transform.into();
 
                 if !self.buffer.as_ref().is_some_and(|b| b == buffer) {
                     self.buffer = Some(Buffer {
@@ -185,6 +183,18 @@ impl RendererSurfaceState {
             }
             None => {}
         };
+
+        // `wl_surface.set_buffer_scale` and `set_buffer_transform` are
+        // double-buffered state: they apply on the next `wl_surface.commit`,
+        // with or without a new `attach`. So the cached values are read on
+        // every commit that has a buffer, not only when a new buffer arrives;
+        // otherwise a scale-only commit keeps rendering at the old scale. The
+        // surface view below is already recomputed each commit, so it picks
+        // the new values up from here.
+        if self.buffer.is_some() {
+            self.buffer_scale = attrs.buffer_scale;
+            self.buffer_transform = attrs.buffer_transform.into();
+        }
 
         let Some(buffer_dimensions) = self.buffer_dimensions else {
             // nothing to be done without a buffer
