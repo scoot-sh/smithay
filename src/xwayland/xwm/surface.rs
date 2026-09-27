@@ -865,6 +865,18 @@ impl X11Surface {
         self.set_allow_commits(state, true);
     }
 
+    /// Tells the X server whether to commit this window's buffers to its
+    /// `wl_surface` at all (`_XWAYLAND_ALLOW_COMMITS`, which only the window
+    /// manager's connection may write). A window manager that refuses a
+    /// window can withhold them, so the refused window costs the compositor
+    /// no buffers. Smithay itself re-enables commits when a sync request it
+    /// started finishes, which never happens for a window it never
+    /// configures.
+    pub fn set_commits_allowed(&self, allowed: bool) {
+        let state = self.state.lock().unwrap();
+        self.set_allow_commits(&state, allowed);
+    }
+
     /// Returns the associated wl_surface.
     ///
     /// This will only return `Some` once:
