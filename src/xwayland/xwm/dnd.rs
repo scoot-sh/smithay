@@ -1155,6 +1155,11 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
                         warn!("Unable to configure proxy dnd window: {}", err);
                         return;
                     }
+                    // Like the unmap in `enter`: without it the proxy stays
+                    // unmapped until some unrelated request flushes the
+                    // connection, and an X drag that crossed an X window cannot
+                    // find the proxy -- nor drop on a Wayland window.
+                    let _ = xwm.conn.flush();
                     drag_state.mapped = true;
                 }
             }
