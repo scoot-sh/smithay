@@ -316,6 +316,7 @@ impl XWmDnd {
         // create our dnd source
         let state = Arc::new(Mutex::new(XwmSourceState {
             mapped: true,
+            hovered: None,
             x11: X11State::Active,
             wayland: WlState::Active,
             source: None,
@@ -789,6 +790,8 @@ struct XwmSourceState {
     source: Option<X11Window>,
 
     mapped: bool,
+    /// The X window the drag is over, if any: entered and not yet left.
+    hovered: Option<X11Window>,
     pending_configure: Option<(u16, u16)>,
 
     active_action: DndAction,
@@ -1039,6 +1042,7 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
             if let Some(active_drag) = xwm.dnd.active_drag.as_mut() {
                 trace!("XDND grab entered X11Surface, unmapping proxy");
                 let mut drag_state = active_drag.state.lock().unwrap();
+                drag_state.hovered = Some(self.window_id());
                 if drag_state.mapped {
                     xwm.conn
                         .unmap_window(*active_drag.target)
@@ -1224,6 +1228,16 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
             let xwm = data.xwm_state(xwm_id);
             if let Some(active_drag) = xwm.dnd.active_drag.as_mut() {
                 let mut drag_state = active_drag.state.lock().unwrap();
+                if drag_state
+                    .hovered
+                    .is_some_and(|hovered| hovered != self.window_id())
+                {
+                    // Another X window was entered first (`DnDGrab` enters a
+                    // target offered nothing before leaving the old one): the
+                    // proxy stays out of the X source's way.
+                    return;
+                }
+                drag_state.hovered = None;
                 if !drag_state.mapped {
                     if let Err(err) = xwm.conn.map_window(*active_drag.target) {
                         warn!("Unable to map proxy dnd window: {}", err);
@@ -1268,6 +1282,38 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
 
             xwm.dnd.active_offer = None;
         }
+    }
+
+    /// A drag from X enters an X window without waiting for its types:
+    /// entering only moves the proxy out of the X source's way, and a source
+    /// names its types to the proxy only where it finds the proxy. A
+    /// toolkit's first look for a target comes before the proxy exists, so
+    /// it finds its own window and names nothing; waiting kept the proxy
+    /// over another client's window on the drag's first motion onto it, the
+    /// source found the proxy there, and a release before the next motion
+    /// dropped nothing. Only the source's own windows wait, and only while
+    /// it has named no types: the proxy stays over them until it does, which
+    /// the drag needs before it can enter a Wayland window.
+    ///
+    /// Not waiting also has `DnDGrab` enter the window before leaving the
+    /// one the drag was over, so a drag between two X windows never maps the
+    /// proxy back in between (see `leave`).
+    fn enter_needs_metadata<S: Source>(&self, data: &mut D, source: &S) -> bool {
+        let Some(xwm_id) = self.xwm_id() else {
+            return true;
+        };
+        if !source.is_client_local(&xwm_id) {
+            return true;
+        }
+        let xwm = data.xwm_state(xwm_id);
+        let Some(active_drag) = xwm.dnd.active_drag.as_ref() else {
+            return true;
+        };
+        let client_mask = !xwm.conn.setup().resource_id_mask;
+        active_drag.owner & client_mask == self.window_id() & client_mask
+            && source
+                .metadata()
+                .is_none_or(|metadata| metadata.mime_types.is_empty())
     }
 
     fn drop<S: Source>(&self, data: &mut D, offer: Option<&mut XwmOfferData<S>>, _seat: &Seat<D>) {

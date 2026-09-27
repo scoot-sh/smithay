@@ -232,6 +232,40 @@ where
         serial: Serial,
         time: InputTime,
     ) {
+        // A target offered nothing (an X window, to a drag from X) is entered
+        // before the old target is left. Leaving an X window maps the window
+        // manager's XDND proxy back and entering one unmaps it, so in the
+        // other order a drag between two X windows maps the proxy over the
+        // second for a moment, and an X source can find it there.
+        let enter_first = self.current_focus.as_ref().is_some_and(|current| {
+            focus.as_ref().is_some_and(|(next, _)| {
+                next != current && next.alive() && !next.enter_needs_metadata(data, &*self.data_source)
+            })
+        });
+        let focus = match focus {
+            Some((next, surface_location)) if enter_first => {
+                let (x, y) = (location - surface_location).into();
+                let offer = next.enter(
+                    data,
+                    #[cfg(feature = "wayland_frontend")]
+                    &self.dh,
+                    self.data_source.clone(),
+                    &self.seat,
+                    Point::new(x, y),
+                    &serial,
+                );
+                if let Some(old) = self.current_focus.replace(next) {
+                    old.leave(data, self.offer_data.as_mut(), &self.seat);
+                }
+                if let Some(offer_data) = self.offer_data.take() {
+                    offer_data.disable();
+                }
+                self.offer_data = offer;
+                return;
+            }
+            focus => focus,
+        };
+
         if self
             .current_focus
             .as_ref()
@@ -257,10 +291,11 @@ where
 
             let (x, y) = (location - surface_location).into();
             if self.current_focus.is_none() {
-                if self
-                    .data_source
-                    .metadata()
-                    .is_some_and(|metadata| metadata.mime_types.is_empty())
+                if focus.enter_needs_metadata(data, &*self.data_source)
+                    && self
+                        .data_source
+                        .metadata()
+                        .is_some_and(|metadata| metadata.mime_types.is_empty())
                 {
                     // delay until they have materialized
                     return;

@@ -134,6 +134,18 @@ pub trait DndFocus<D: SeatHandler>: WaylandFocus + IsAlive + PartialEq {
     /// An active Drag'n'Drop operation, which has previously
     /// entered the client, has been dropped.
     fn drop<S: Source>(&self, data: &mut D, offer: Option<&mut Self::OfferData<S>>, seat: &Seat<D>);
+
+    /// Whether entering this target waits for `source` to name its mime
+    /// types.
+    ///
+    /// A drag enters no target until its source has named what it offers,
+    /// since a target is offered those types as it is entered. A target
+    /// offered nothing need not wait: another client's X window, to a drag
+    /// from X, which the X source speaks to itself.
+    fn enter_needs_metadata<S: Source>(&self, data: &mut D, source: &S) -> bool {
+        let _ = (data, source);
+        true
+    }
 }
 #[cfg(not(feature = "xwayland"))]
 /// A potential Drag'n'Drop target
@@ -172,4 +184,16 @@ pub trait DndFocus<D: SeatHandler>: IsAlive + PartialEq {
     /// An active Drag'n'Drop operation, which has previously
     /// entered the client, has been dropped.
     fn drop<S: Source>(&self, data: &mut D, offer: Option<&mut Self::OfferData<S>>, seat: &Seat<D>);
+
+    /// Whether entering this target waits for `source` to name its mime
+    /// types.
+    ///
+    /// A drag enters no target until its source has named what it offers,
+    /// since a target is offered those types as it is entered. A target
+    /// offered nothing need not wait: another client's X window, to a drag
+    /// from X, which the X source speaks to itself.
+    fn enter_needs_metadata<S: Source>(&self, data: &mut D, source: &S) -> bool {
+        let _ = (data, source);
+        true
+    }
 }
