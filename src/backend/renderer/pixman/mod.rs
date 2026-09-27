@@ -594,7 +594,12 @@ impl Frame for PixmanFrame<'_, '_> {
             };
 
             src_image.set_filter(filter, &[])?;
-            src_image.set_repeat(Repeat::None);
+            // Pad (clamp to edge) rather than None: a bilinear tap at the
+            // texture edge otherwise reads past it, where pixman returns
+            // transparent black, so any upscaled surface fades to a
+            // semi-transparent 1-px border. Matches the GLES backend, which
+            // samples with CLAMP_TO_EDGE.
+            src_image.set_repeat(Repeat::Pad);
 
             let has_alpha = DrmFourcc::try_from(src_image.format())
                 .ok()
