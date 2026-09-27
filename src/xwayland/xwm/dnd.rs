@@ -138,6 +138,17 @@ impl XWmDnd {
         res
     }
 
+    /// Takes `XdndSelection` back for the window manager's own window.
+    fn reclaim_selection(&self) -> Result<(), ReplyOrIdError> {
+        self.selection.conn.set_selection_owner(
+            *self.selection.window,
+            self.selection.atoms.XdndSelection,
+            CURRENT_TIME,
+        )?;
+        self.selection.conn.flush()?;
+        Ok(())
+    }
+
     pub fn has_window(&self, window: &X11Window) -> bool {
         if let Some(drag) = self.active_drag.as_ref() {
             if drag.target == *window {
@@ -167,28 +178,21 @@ impl XWmDnd {
             return Ok(());
         }
 
-        if let Some(offer) = xwm.dnd.active_offer.as_ref() {
-            let offer_state = offer.state.lock().unwrap();
-            if !offer_state.dropped {
+        // A Wayland drop onto an X window whose target has not finished it
+        // (it may be hung) keeps its offer. Only a real X drag -- a grab to
+        // take over that `allow_drag` accepts, checked below -- gives it up;
+        // any other client taking the selection is taken back from, as
+        // while a Wayland drag is still over an X window.
+        let pending_drop = match xwm.dnd.active_offer.as_ref() {
+            Some(offer) if !offer.state.lock().unwrap().dropped => {
                 // a Wayland drag is still over an X window: a rough X11 client
                 // tries to take over the selection, take it back.
-                std::mem::drop(offer_state);
-                xwm.conn.set_selection_owner(
-                    *xwm.dnd.selection.window,
-                    xwm.atoms.XdndSelection,
-                    CURRENT_TIME,
-                )?;
+                xwm.dnd.reclaim_selection()?;
                 return Ok(());
             }
-            // The Wayland drag has ended in a drop its X target never
-            // finished (a hung target). An X client taking the selection is
-            // a new drag: give up the old offer rather than refuse every X
-            // drag from now on.
-            debug!("Giving up an XDND offer whose drop never finished");
-            std::mem::drop(offer_state);
-            let offer = xwm.dnd.active_offer.take().unwrap();
-            offer.source.cancel();
-        }
+            Some(_) => true,
+            None => false,
+        };
 
         if let Some(active_drag) = xwm.dnd.active_drag.as_ref() {
             if active_drag.owner == xwm.dnd.selection.owner
@@ -207,6 +211,10 @@ impl XWmDnd {
         }
 
         if event.owner == x11rb::NONE {
+            if pending_drop {
+                xwm.dnd.reclaim_selection()?;
+                return Ok(());
+            }
             trace!("XDND selection went away");
             xwm.dnd.active_drag.take();
             xwm.dnd.xdnd_active.store(false, Ordering::Release);
@@ -243,15 +251,33 @@ impl XWmDnd {
             (Some((seat, s1, _)), Some((_, s2, _))) if s1 >= s2 => (seat.clone(), *s1, GrabType::Pointer),
             (Some((seat, serial, _)), None) => (seat.clone(), *serial, GrabType::Pointer),
             (_, Some((seat, serial, _))) => (seat.clone(), *serial, GrabType::Touch),
-            (None, None) => return Ok(()),
+            (None, None) => {
+                if pending_drop {
+                    data.xwm_state(id).dnd.reclaim_selection()?;
+                }
+                return Ok(());
+            }
         };
         if !data.allow_drag(id, event.owner, &seat, serial, grab) {
             debug!(owner = event.owner, ?serial, "Refused an XDND drag");
+            if pending_drop {
+                data.xwm_state(id).dnd.reclaim_selection()?;
+            }
             return Ok(());
         }
 
-        // create our drop proxy
         let xwm = data.xwm_state(id);
+        if pending_drop {
+            // A new X drag while a Wayland drop onto X was never finished
+            // (a hung target): give up the old offer rather than refuse
+            // every X drag from now on.
+            debug!("Giving up an XDND offer whose drop never finished");
+            if let Some(offer) = xwm.dnd.active_offer.take() {
+                offer.source.cancel();
+            }
+        }
+
+        // create our drop proxy
         let window = xwm.conn.generate_id()?;
         xwm.conn.create_window(
             xwm.screen.root_depth,
@@ -1125,6 +1151,13 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
                 })),
                 source,
             };
+            if let Some(stale) = xwm.dnd.active_offer.take() {
+                // a drop whose target never finished it (a hung target): its
+                // source would otherwise never hear how it ended.
+                if stale.state.lock().unwrap().dropped {
+                    stale.source.cancel();
+                }
+            }
             xwm.dnd.active_offer = Some(XwmActiveOffer {
                 state: offer.state.clone(),
                 source: offer.source.clone(),
