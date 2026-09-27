@@ -373,20 +373,38 @@ impl XWmDnd {
                     let _ = self.selection.conn.flush();
                     offer_state.pos_pending = true;
                 } else if offer_state.dropped {
-                    // finish drop
-
-                    offer.source.drop_performed();
-
-                    let data = [*self.selection.window, 0, CURRENT_TIME, 0, 0];
+                    // finish the drop the grab deferred on this status. The grab
+                    // has already told the source `drop_performed`.
+                    let refused =
+                        !offer_state.client_accepts || offer_state.preferred_action == DndAction::None;
+                    let (atom, data) = if refused {
+                        // the target's answer to our last position refuses the
+                        // drop after all: leave instead, and end the offer, as
+                        // no XdndFinished will come for a drop never sent.
+                        (
+                            self.selection.atoms.XdndLeave,
+                            [*self.selection.window, 0, 0, 0, 0],
+                        )
+                    } else {
+                        (
+                            self.selection.atoms.XdndDrop,
+                            [*self.selection.window, 0, CURRENT_TIME, 0, 0],
+                        )
+                    };
                     if let Err(err) = self.selection.conn.send_event(
                         false,
                         window.window_id(),
                         EventMask::NO_EVENT,
-                        ClientMessageEvent::new(32, window.window_id(), self.selection.atoms.XdndDrop, data),
+                        ClientMessageEvent::new(32, window.window_id(), atom, data),
                     ) {
-                        warn!("Failed to send DND_DROP event: {:?}", err);
+                        warn!("Failed to send deferred DND_DROP/DND_LEAVE event: {:?}", err);
                     }
                     let _ = self.selection.conn.flush();
+                    if refused {
+                        offer.source.cancel();
+                        std::mem::drop(offer_state);
+                        self.active_offer = None;
+                    }
                 }
             }
         }
@@ -1201,12 +1219,17 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
         };
 
         let mut state = offer.state.lock().unwrap();
+        // The grab decides from the same state whether the drop happened, and
+        // tells the source either way (`drop_performed` or `cancel`). A drop the
+        // target has not accepted is no drop: leave it unmarked, so the grab's
+        // trailing `leave` sends `XdndLeave` and ends the offer.
+        if !state.validated() {
+            return;
+        }
         state.dropped = true;
         if state.pos_pending {
             return;
         }
-
-        offer.source.drop_performed();
 
         let data = [*xwm.dnd.selection.window, 0, CURRENT_TIME, 0, 0];
         trace!("Sending XdndDrop: {:?}", data);
@@ -1222,6 +1245,12 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
     }
 }
 
+impl XwmOfferState {
+    fn validated(&self) -> bool {
+        self.active && self.preferred_action != DndAction::None && self.client_accepts
+    }
+}
+
 impl<S: Source> OfferData for XwmOfferData<S> {
     fn disable(&self) {
         self.state.lock().unwrap().active = false;
@@ -1232,7 +1261,6 @@ impl<S: Source> OfferData for XwmOfferData<S> {
     }
 
     fn validated(&self) -> bool {
-        let state = self.state.lock().unwrap();
-        state.active && state.preferred_action != DndAction::None && state.client_accepts
+        self.state.lock().unwrap().validated()
     }
 }
