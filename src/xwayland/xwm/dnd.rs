@@ -119,6 +119,22 @@ impl XWmDnd {
                 res = true;
             }
         }
+        if let Some(offer) = self.active_offer.as_ref() {
+            let mut offer_state = offer.state.lock().unwrap();
+            if offer_state.target == *window || offer_state.proxy.is_some_and(|proxy| proxy == *window) {
+                // The target is gone, so no XdndStatus or XdndFinished will
+                // come. Left in place, the offer would make every later X drag
+                // look like a rough client taking the selection.
+                // Disabled, a drag still hovering it cannot validate a drop;
+                // one already dropped never finishes, so its source is told.
+                offer_state.active = false;
+                if offer_state.dropped {
+                    offer.source.cancel();
+                }
+                std::mem::drop(offer_state);
+                self.active_offer = None;
+            }
+        }
         res
     }
 
@@ -151,11 +167,27 @@ impl XWmDnd {
             return Ok(());
         }
 
-        if xwm.dnd.active_offer.is_some() {
-            // rough X11 client tries to take over the selection, take it back.
-            xwm.conn
-                .set_selection_owner(*xwm.dnd.selection.window, xwm.atoms.XdndSelection, CURRENT_TIME)?;
-            return Ok(());
+        if let Some(offer) = xwm.dnd.active_offer.as_ref() {
+            let offer_state = offer.state.lock().unwrap();
+            if !offer_state.dropped {
+                // a Wayland drag is still over an X window: a rough X11 client
+                // tries to take over the selection, take it back.
+                std::mem::drop(offer_state);
+                xwm.conn.set_selection_owner(
+                    *xwm.dnd.selection.window,
+                    xwm.atoms.XdndSelection,
+                    CURRENT_TIME,
+                )?;
+                return Ok(());
+            }
+            // The Wayland drag has ended in a drop its X target never
+            // finished (a hung target). An X client taking the selection is
+            // a new drag: give up the old offer rather than refuse every X
+            // drag from now on.
+            debug!("Giving up an XDND offer whose drop never finished");
+            std::mem::drop(offer_state);
+            let offer = xwm.dnd.active_offer.take().unwrap();
+            offer.source.cancel();
         }
 
         if let Some(active_drag) = xwm.dnd.active_drag.as_ref() {
