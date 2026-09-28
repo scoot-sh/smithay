@@ -209,8 +209,12 @@ impl XSettings {
             self.atoms._XSETTINGS_SETTINGS,
             self.atoms._XSETTINGS_SETTINGS,
             &self.serialize(),
-        )
-        .map(|_| ())
+        )?;
+        // Flushed here: the window manager's event thread only reads, so an
+        // unflushed write waits in x11rb's buffer until some unrelated
+        // request flushes it, and a toolkit reading the settings meanwhile
+        // (one started right after XWayland is ready) sees none of them.
+        conn.flush()
     }
 }
 
