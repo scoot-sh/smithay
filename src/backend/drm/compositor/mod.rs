@@ -153,13 +153,13 @@ use crate::{
         SwapBuffersError,
         allocator::{
             Allocator, Buffer, Slot, Swapchain,
-            dmabuf::{AsDmabuf, Dmabuf},
+            dmabuf::{AsDmabuf, Dmabuf, WeakDmabuf},
             format::{get_opaque, has_alpha},
             gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags, GbmDevice},
         },
         drm::{DrmError, PlaneDamageClips, plane_has_property},
         renderer::{
-            Bind, Color32F, DebugFlags, Renderer, RendererSuper, Texture, buffer_y_inverted,
+            Bind, Color32F, DebugFlags, ImportDma, Renderer, RendererSuper, Texture, buffer_y_inverted,
             damage::{Error as OutputDamageTrackerError, OutputDamageTracker},
             element::{
                 Element, Id, Kind, RenderElement, RenderElementPresentationState, RenderElementState,
@@ -209,6 +209,7 @@ impl RenderElementState {
 #[derive(Debug)]
 enum ScanoutBuffer<B: Buffer> {
     Wayland(crate::backend::renderer::utils::Buffer),
+    Dmabuf(Dmabuf),
     Swapchain(Arc<Slot<B>>),
     Cursor(Arc<GbmBuffer>),
 }
@@ -219,6 +220,7 @@ impl<B: Buffer> Clone for ScanoutBuffer<B> {
             Self::Wayland(arg0) => Self::Wayland(arg0.clone()),
             Self::Swapchain(arg0) => Self::Swapchain(arg0.clone()),
             Self::Cursor(arg0) => Self::Cursor(arg0.clone()),
+            Self::Dmabuf(arg0) => Self::Dmabuf(arg0.clone()),
         }
     }
 }
@@ -245,6 +247,7 @@ impl<B: Buffer> ScanoutBuffer<B> {
         match storage {
             UnderlyingStorage::Wayland(buffer) => Some(Self::Wayland(buffer.clone())),
             UnderlyingStorage::Memory { .. } => None,
+            UnderlyingStorage::Dmabuf(dmabuf) => Some(Self::Dmabuf(dmabuf.clone())),
         }
     }
 }
@@ -336,6 +339,7 @@ impl<B: Buffer, F: Framebuffer> Framebuffer for DrmScanoutBuffer<B, F> {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 enum ElementFramebufferCacheBuffer {
     Wayland(wayland_server::Weak<WlBuffer>),
+    Dmabuf(WeakDmabuf),
 }
 
 impl ElementFramebufferCacheBuffer {
@@ -344,6 +348,7 @@ impl ElementFramebufferCacheBuffer {
         match storage {
             UnderlyingStorage::Wayland(buffer) => Some(Self::Wayland(buffer.downgrade())),
             UnderlyingStorage::Memory { .. } => None,
+            UnderlyingStorage::Dmabuf(dmabuf) => Some(Self::Dmabuf(dmabuf.weak())),
         }
     }
 }
@@ -370,6 +375,7 @@ impl ElementFramebufferCacheKey {
     fn is_alive(&self) -> bool {
         match self.buffer {
             ElementFramebufferCacheBuffer::Wayland(ref buffer) => buffer.is_alive(),
+            ElementFramebufferCacheBuffer::Dmabuf(ref dmabuf) => !dmabuf.is_gone(),
         }
     }
 }
@@ -3322,6 +3328,12 @@ where
                         }
                     }
                 }
+                UnderlyingStorage::Dmabuf(dmabuf) => ImportDma::import_dmabuf(
+                    pixman_renderer,
+                    dmabuf,
+                    Some(&[element.src().to_i32_up()]),
+                )
+                .ok(),
             }?;
 
             let ret = cursor_buffer
@@ -4119,7 +4131,17 @@ fn apply_underlying_storage_transform(
                 element_transform
             }
         }
-        UnderlyingStorage::Memory { .. } => element_transform,
+        UnderlyingStorage::Dmabuf(dmabuf) if dmabuf.y_inverted() => match element_transform {
+            Transform::Normal => Transform::Flipped,
+            Transform::_90 => Transform::Flipped90,
+            Transform::_180 => Transform::Flipped180,
+            Transform::_270 => Transform::Flipped270,
+            Transform::Flipped => Transform::Normal,
+            Transform::Flipped90 => Transform::_90,
+            Transform::Flipped180 => Transform::_180,
+            Transform::Flipped270 => Transform::_270,
+        },
+        UnderlyingStorage::Memory { .. } | UnderlyingStorage::Dmabuf(_) => element_transform,
     }
 }
 
@@ -4278,6 +4300,9 @@ where
 
             copy_to_bo(memory, memory.stride(), memory.size().h)
         }
+        // No fast path: rendered through the pixman fallback instead, which
+        // maps the dma-buf.
+        UnderlyingStorage::Dmabuf(_) => false,
     }
 }
 

@@ -3,12 +3,14 @@
 use std::os::unix::io::AsFd;
 
 use drm::node::DrmNode;
+use drm_fourcc::DrmModifier;
 
 use super::{ExportBuffer, ExportFramebuffer};
 #[cfg(feature = "wayland_frontend")]
 use crate::backend::drm::gbm::framebuffer_from_wayland_buffer;
 use crate::backend::{
     allocator::{
+        Buffer,
         dmabuf::AsDmabuf,
         gbm::{GbmBuffer, GbmConvertError},
     },
@@ -72,6 +74,14 @@ impl<A: AsFd + 'static> ExportFramebuffer<GbmBuffer> for GbmFramebufferExporter<
             ExportBuffer::Wayland(wl_buffer) => {
                 framebuffer_from_wayland_buffer(drm, &self.gbm, wl_buffer, use_opaque)?
             }
+            // Weston's rule, as for a dma-buf `wl_buffer`
+            // (`framebuffer_from_wayland_buffer`): a buffer with no explicit
+            // modifier has a layout neither side can know, so it is not
+            // handed to KMS.
+            ExportBuffer::Dmabuf(dmabuf) if dmabuf.format().modifier == DrmModifier::Invalid => None,
+            ExportBuffer::Dmabuf(dmabuf) => {
+                framebuffer_from_dmabuf(drm, &self.gbm, dmabuf, use_opaque, false).map(Some)?
+            }
             ExportBuffer::Allocator(buffer) => {
                 let foreign = self.drm_node.is_none()
                     || buffer.device_node().is_none()
@@ -117,6 +127,10 @@ impl<A: AsFd + 'static> ExportFramebuffer<GbmBuffer> for GbmFramebufferExporter<
                 Some(crate::backend::renderer::BufferType::Egl) => true,
                 _ => false,
             },
+            // The compositor's own buffer, like `Allocator`: `import_node`
+            // filters client buffers only, and an import onto this device
+            // that fails is refused cleanly in `add_framebuffer`.
+            ExportBuffer::Dmabuf(_) => true,
             ExportBuffer::Allocator(_) => true,
         }
     }
@@ -125,6 +139,7 @@ impl<A: AsFd + 'static> ExportFramebuffer<GbmBuffer> for GbmFramebufferExporter<
     #[cfg(not(feature = "wayland_frontend"))]
     fn can_add_framebuffer(&self, buffer: &ExportBuffer<'_, GbmBuffer>) -> bool {
         match buffer {
+            ExportBuffer::Dmabuf(_) => true,
             ExportBuffer::Allocator(_) => true,
         }
     }

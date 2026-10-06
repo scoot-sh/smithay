@@ -28,6 +28,7 @@ use std::{
 use wayland_server::{Resource, backend::ObjectId};
 
 use crate::{
+    backend::allocator::dmabuf::Dmabuf,
     output::{Output, WeakOutput},
     utils::{Buffer as BufferCoords, Physical, Point, Rectangle, Scale, Transform, user_data::UserDataMap},
 };
@@ -256,6 +257,13 @@ pub enum UnderlyingStorage<'a> {
     Wayland(&'a Buffer),
     /// A memory backed buffer
     Memory(&'a memory::MemoryBuffer),
+    /// A dma-buf the compositor itself owns, not a client's `wl_buffer`
+    /// (for example a cursor image allocated so an overlay plane can scan it
+    /// out where the CRTC has no cursor plane).
+    ///
+    /// It takes the same direct scan-out path as a dma-buf `wl_buffer`, with
+    /// the same rule: one without an explicit modifier is never handed to KMS.
+    Dmabuf(&'a Dmabuf),
 }
 
 /// Defines the (optional) reason why a [`Element`] was selected for

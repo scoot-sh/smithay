@@ -9,7 +9,10 @@ use std::{
 #[cfg(feature = "wayland_frontend")]
 use wayland_server::protocol::wl_buffer::WlBuffer;
 
-use crate::backend::{allocator::Buffer, renderer::element::UnderlyingStorage};
+use crate::backend::{
+    allocator::{Buffer, dmabuf::Dmabuf},
+    renderer::element::UnderlyingStorage,
+};
 
 use super::{DrmDeviceFd, Framebuffer};
 
@@ -26,6 +29,8 @@ pub enum ExportBuffer<'a, B: Buffer> {
     Wayland(&'a WlBuffer),
     /// A [`Allocator`][crate::backend::allocator::Allocator] buffer
     Allocator(&'a B),
+    /// A dma-buf owned by the compositor, see [`UnderlyingStorage::Dmabuf`]
+    Dmabuf(&'a Dmabuf),
 }
 
 impl<'a, B: Buffer> ExportBuffer<'a, B> {
@@ -36,6 +41,7 @@ impl<'a, B: Buffer> ExportBuffer<'a, B> {
             #[cfg(feature = "wayland_frontend")]
             UnderlyingStorage::Wayland(buffer) => Some(Self::Wayland(buffer)),
             UnderlyingStorage::Memory { .. } => None,
+            UnderlyingStorage::Dmabuf(dmabuf) => Some(Self::Dmabuf(dmabuf)),
         }
     }
 }
