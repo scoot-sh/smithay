@@ -78,36 +78,40 @@ impl LibSeatSession {
         };
 
         drop(_guard);
-        seat.map(|mut seat| {
-            let seat_name = seat.name().to_owned();
+        seat.map_err(|err| Error::FailedToOpenSession(Errno::from_raw_os_error(err.into())))
+            .and_then(|mut seat| {
+                let seat_name = seat.name().to_owned();
 
-            // In some cases enable_seat event is available right after startup
-            // so, we can dispatch it
-            seat.dispatch(0).unwrap();
-            let active = matches!(rx.try_recv(), Ok(SeatEvent::Enable));
+                // In some cases enable_seat event is available right after startup
+                // so, we can dispatch it. The daemon can already be gone here
+                // (seatd killed between the open above and this call): that is a
+                // failed open, which the caller handles, not a panic.
+                seat.dispatch(0).map_err(|err| {
+                    Error::FailedToOpenSession(Errno::from_raw_os_error(err.into()))
+                })?;
+                let active = matches!(rx.try_recv(), Ok(SeatEvent::Enable));
 
-            let internal = Rc::new(LibSeatSessionImpl {
-                seat: RefCell::new(seat),
-                active: Arc::new(AtomicBool::new(active)),
-                devices: RefCell::new(HashMap::new()),
-            });
+                let internal = Rc::new(LibSeatSessionImpl {
+                    seat: RefCell::new(seat),
+                    active: Arc::new(AtomicBool::new(active)),
+                    devices: RefCell::new(HashMap::new()),
+                });
 
-            let session = LibSeatSession {
-                internal: Rc::downgrade(&internal),
-                seat_name,
-                span: span.clone(),
-            };
+                let session = LibSeatSession {
+                    internal: Rc::downgrade(&internal),
+                    seat_name,
+                    span: span.clone(),
+                };
 
-            let notifier = LibSeatSessionNotifier {
-                internal,
-                rx,
-                token: None,
-                span,
-            };
+                let notifier = LibSeatSessionNotifier {
+                    internal,
+                    rx,
+                    token: None,
+                    span,
+                };
 
-            (session, notifier)
-        })
-        .map_err(|err| Error::FailedToOpenSession(Errno::from_raw_os_error(err.into())))
+                Ok((session, notifier))
+            })
     }
 }
 
@@ -212,11 +216,21 @@ impl EventSource for LibSeatSessionNotifier {
         F: FnMut(SessionEvent, &mut ()),
     {
         if Some(token) == self.token {
-            self.internal.seat.borrow_mut().dispatch(0).unwrap();
+            // The seat daemon can die at any time -- seatd killed, logind
+            // restarted, either backend libseat picked -- and from then on
+            // `dispatch` fails (ENOTCONN once the socket is gone). That is a
+            // lost session, which the event loop propagates so the compositor
+            // shuts down cleanly, not a panic. No pause is possible here:
+            // without the daemon no later enable can ever resume it.
+            if let Err(err) = self.internal.seat.borrow_mut().dispatch(0) {
+                return Err(Error::ConnectionLost(Errno::from_raw_os_error(err.into())));
+            }
         }
 
         let internal = &self.internal;
-        self.rx
+        let mut connection_lost = None;
+        let action = self
+            .rx
             .process_events(readiness, token, |event, _| match event {
                 channel::Event::Msg(event) => match event {
                     SeatEvent::Enable => {
@@ -225,7 +239,17 @@ impl EventSource for LibSeatSessionNotifier {
                     }
                     SeatEvent::Disable => {
                         internal.active.store(false, Ordering::SeqCst);
-                        internal.seat.borrow_mut().disable().unwrap();
+                        // The connection lived when `dispatch` above ran, so
+                        // this fails only if it died in between: pausing then
+                        // would hang forever on an enable that cannot come,
+                        // so this is a lost session too.
+                        if let Err(err) = internal.seat.borrow_mut().disable() {
+                            connection_lost =
+                                Some(Error::ConnectionLost(Errno::from_raw_os_error(
+                                    err.into(),
+                                )));
+                            return;
+                        }
                         callback(SessionEvent::PauseSession, &mut ());
                     }
                 },
@@ -233,7 +257,11 @@ impl EventSource for LibSeatSessionNotifier {
                     // Tx is stored inside of Seat, and Rc<Seat> is stored in LibSeatSessionNotifier so this is unreachable
                 }
             })
-            .map_err(|_| Error::SessionLost)
+            .map_err(|_| Error::SessionLost)?;
+        if let Some(err) = connection_lost {
+            return Err(err);
+        }
+        Ok(action)
     }
 
     fn register(&mut self, poll: &mut Poll, factory: &mut TokenFactory) -> calloop::Result<()> {
@@ -293,6 +321,12 @@ pub enum Error {
     #[error("Failed to change vt: {0}")]
     FailedToChangeVt(Errno),
 
+    /// The seat connection is gone (seatd killed, logind restarted): no
+    /// event will ever resume this session, so the compositor shuts down
+    /// rather than pausing forever or panicking.
+    #[error("Lost the seat connection: {0}")]
+    ConnectionLost(Errno),
+
     /// Session is already closed,
     #[error("Session is already closed")]
     SessionLost,
@@ -304,7 +338,8 @@ impl AsErrno for Error {
             &Self::FailedToOpenSession(errno)
             | &Self::FailedToOpenDevice(errno)
             | &Self::FailedToCloseDevice(errno)
-            | &Self::FailedToChangeVt(errno) => Some(errno.raw_os_error()),
+            | &Self::FailedToChangeVt(errno)
+            | &Self::ConnectionLost(errno) => Some(errno.raw_os_error()),
             _ => None,
         }
     }
