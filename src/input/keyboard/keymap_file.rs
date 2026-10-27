@@ -71,6 +71,19 @@ impl KeymapFile {
         use std::{io::Write, path::PathBuf};
 
         if let Some(file) = supports_sealed.then_some(self.sealed.as_ref()).flatten() {
+            // One open file description per send, not the sealed fd itself:
+            // `SCM_RIGHTS` hands every receiver the same description, offset
+            // included, so the first `read()`-based client to read would move
+            // the shared offset to the end and every later client would read
+            // zero bytes. The independent copy is closed once the send
+            // returns; the receiver's own copy outlives it. If it cannot be
+            // opened (no procfs), fall back to sharing the description, the
+            // previous behaviour.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if let Ok(independent) = file.open_independent() {
+                cb(independent.as_fd(), file.size());
+                return Ok(());
+            }
             cb(file.as_fd(), file.size());
         } else {
             let dir = std::env::var_os("XDG_RUNTIME_DIR")

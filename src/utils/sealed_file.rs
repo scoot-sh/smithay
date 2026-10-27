@@ -95,6 +95,30 @@ impl SealedFile {
         })
     }
 
+    /// Open an independent read-only copy of the sealed data: a new open
+    /// file description with its own offset at 0.
+    ///
+    /// The sealed file is one file with one offset, and `SCM_RIGHTS` hands
+    /// every receiver that same description, offset included: the first
+    /// `read()`-based `wl_keyboard` client to read moves it to the end and
+    /// every later client reads zero bytes (toolkits `mmap`, which ignores
+    /// offsets, and never notice). Reopening through `/proc/self/fd` gives
+    /// each keymap send its own description, so readers never disturb each
+    /// other. Seals live on the file rather than the description, so the
+    /// copy stays sealed; it is closed once the send returns, and the
+    /// receiver's own copy outlives it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn open_independent(&self) -> std::io::Result<File> {
+        let path = format!("/proc/self/fd/{}", self.file.as_raw_fd());
+        let owned = rustix::fs::openat(
+            rustix::fs::CWD,
+            path.as_str(),
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        Ok(File::from(owned))
+    }
+
     /// Size of the data contained in the sealed file.
     pub fn size(&self) -> usize {
         self.size
@@ -110,5 +134,43 @@ impl AsRawFd for SealedFile {
 impl AsFd for SealedFile {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.file.as_fd()
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    /// Two independent copies must not share an offset: reading one to the
+    /// end leaves the other (and the sealed file itself) at 0. This is the
+    /// property `wl_keyboard.keymap` sends rely on.
+    #[test]
+    fn independent_copies_do_not_share_an_offset() {
+        let sealed = SealedFile::with_data(c"test-keymap", b"0123456789").expect("a sealed file");
+        let mut first = sealed.open_independent().expect("a first copy");
+        let mut second = sealed.open_independent().expect("a second copy");
+
+        let mut first_bytes = Vec::new();
+        first.read_to_end(&mut first_bytes).expect("a full read");
+        assert_eq!(first_bytes, b"0123456789");
+
+        let mut second_bytes = Vec::new();
+        second
+            .read_to_end(&mut second_bytes)
+            .expect("a full read after the first copy was drained");
+        assert_eq!(second_bytes, b"0123456789");
+
+        // The sealed file's own offset is untouched: no seek, still a full
+        // read. A clone shares its description, which is exactly what makes
+        // this an assertion rather than a tautology.
+        let mut sealed_bytes = Vec::new();
+        sealed
+            .file
+            .try_clone()
+            .expect("a clone shares the offset")
+            .read_to_end(&mut sealed_bytes)
+            .expect("the sealed file itself is untouched");
+        assert_eq!(sealed_bytes, b"0123456789");
     }
 }
